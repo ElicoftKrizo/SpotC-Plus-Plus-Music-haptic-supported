@@ -5,13 +5,16 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = SpotHaptics
 
-# Identify source files directly in the main directory
+# Identify source files
 SpotHaptics_FILES = SpotHapticsHooks.x.swift HapticEngine.swift
 SpotHaptics_FRAMEWORKS = CoreHaptics UIKit Foundation
 
-# FIX: Tell Theos to automatically hook up the Orion engine components
+# Automatic Orion engine components linkage
 SpotHaptics_LOGOSFLAGS = -c orion
 SpotHaptics_CFLAGS = -fobjc-arc
 SpotHaptics_SWIFTFLAGS = -I.
+
+# FIX: Force Theos to look in the Homebrew bin directory for ldid!
+export LDID = /opt/homebrew/bin/ldid
 
 include $(THEOS)/makefiles/tweak.mk
