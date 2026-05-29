@@ -1,0 +1,11 @@
+Package: com.spotc.spothaptics
+Name: SpotHaptics
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Custom CoreHaptics playback for SpotC++.
+ Bridges Spotify's playback engine to Apple's CoreHaptics framework,
+ playing bundled .ahap haptic patterns in sync with songs.
+Maintainer: SpotC++ HapticMod
+Author: SpotC++ HapticMod
+Section: Tweaks
+Depends: mobilesubstrate, dev.theos.orion14
