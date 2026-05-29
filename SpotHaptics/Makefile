@@ -5,7 +5,8 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = SpotHaptics
 
-SpotHaptics_FILES = Sources/SpotHaptics/SpotHapticsHooks.x.swift Sources/SpotHaptics/HapticEngine.swift
+# FIX: Removed "Sources/SpotHaptics/" so it finds the files right in the main folder!
+SpotHaptics_FILES = SpotHapticsHooks.x.swift HapticEngine.swift
 SpotHaptics_FRAMEWORKS = CoreHaptics UIKit Foundation
 SpotHaptics_LIBRARIES = orion
 SpotHaptics_CFLAGS = -fobjc-arc
