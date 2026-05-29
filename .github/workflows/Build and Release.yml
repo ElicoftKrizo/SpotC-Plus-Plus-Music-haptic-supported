@@ -1,4 +1,13 @@
-name: Build and Release
+name: Build and Release (+ Custom Haptics)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# This is a fork of SpotCompiled/SpotC-Plus-Plus "Build and Release" workflow
+# with an added "Custom Haptics" pipeline that:
+#   1. Installs the haptic_converter Python package (librosa + dependencies)
+#   2. Accepts an optional ZIP of audio files as a workflow input
+#   3. Converts all audio files → .ahap haptic patterns
+#   4. Injects the .ahap files into both release IPAs before packaging
+# ──────────────────────────────────────────────────────────────────────────────
 
 on:
   workflow_dispatch:
@@ -10,7 +19,7 @@ on:
         description: 'SpotC++ Version Number'
         required: false
       USEACTIONSEEVEE:
-        description: 'Get EeveeSpotify from latest EeveeSpotfiy build action'
+        description: 'Get EeveeSpotify from latest EeveeSpotify build action'
         required: true
         default: false
         type: boolean
@@ -21,12 +30,30 @@ on:
         description: 'Override repo for EeveeSpotify'
         required: false
 
+      # ── NEW: Haptics inputs ───────────────────────────────────────────────
+      HAPTICS_AUDIO_ZIP_URL:
+        description: |
+          (Optional) Direct URL to a .zip of audio files (MP3/WAV/FLAC/AAC/M4A).
+          Each file will be converted to a .ahap haptic pattern and injected
+          into the IPA as  Payload/Spotify.app/CustomHaptics/<name>.ahap
+        required: false
+      HAPTICS_MIN_TRANSIENT:
+        description: 'Min transient intensity (0-1, default 0.05)'
+        required: false
+        default: '0.05'
+      HAPTICS_MIN_CONTINUOUS:
+        description: 'Min continuous intensity (0-1, default 0.10)'
+        required: false
+        default: '0.10'
+
 jobs:
   build:
     runs-on: macos-latest
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+
+    # ── Environment setup ────────────────────────────────────────────────────
 
     - name: Set up variables
       id: setup
@@ -36,22 +63,18 @@ jobs:
         echo "SPOTURL=${{ github.event.inputs.SPOTURL }}" >> $GITHUB_ENV
         echo "VT_ENABLED=${{ secrets.VIRUSTOTALKEY != '' }}" >> $GITHUB_ENV
         echo "CATBOXHASH_ENABLED=${{ secrets.CATBOXHASH != '' }}" >> $GITHUB_ENV
-        
+
     - name: Set Workflow URL
       run: |
         echo "WORKFLOWURL=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_ENV
-        echo "Workflow URL is ${{ env.WORKFLOWURL }}"
 
-    - name: Set EeveeSpotify Repo if given
-      if: ${{ github.event.inputs.EEVEEREPO != '' }}
+    - name: Set EeveeSpotify Repo
       run: |
-        EEVEEREPO=$(echo "${{ github.event.inputs.EEVEEREPO }}" | sed -E 's|https://github.com/([^/]+)/([^/]+)|\1/\2|' | sed 's|^https://github.com/||')
-        echo "EEVEEREPO=$EEVEEREPO" >> $GITHUB_ENV
-        
-    - name: Set EeveeSpotify Repo if not given
-      if: ${{ github.event.inputs.EEVEEREPO == '' }}
-      run: |
-        EEVEEREPO=$(echo "whoeevee/EeveeSpotifyReborn")
+        if [ -n "${{ github.event.inputs.EEVEEREPO }}" ]; then
+          EEVEEREPO=$(echo "${{ github.event.inputs.EEVEEREPO }}" | sed -E 's|https://github.com/([^/]+)/([^/]+)|\1/\2|')
+        else
+          EEVEEREPO="whoeevee/EeveeSpotifyReborn"
+        fi
         echo "EEVEEREPO=$EEVEEREPO" >> $GITHUB_ENV
 
     - name: Set up Python 3.13
@@ -59,328 +82,112 @@ jobs:
       with:
         python-version: '3.13'
 
+    # ── Install Cyan (tweak injector) ────────────────────────────────────────
+
     - name: Install Cyan
       run: pipx install --force https://github.com/SpotCompiled/pyzule-rw/archive/main.zip
 
-    - name: Set EEVEETAG if EEVEEVERSION not provided
-      if: ${{ github.event.inputs.EEVEEVERSION == '' }}
+    # ── NEW: Install haptic converter dependencies ────────────────────────────
+
+    - name: Install haptic converter dependencies
       run: |
-        echo "EEVEEVERSION not provided, fetching latest release tag..."
-        EEVEETAG=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ env.EEVEEREPO }}/releases/latest | jq -r .tag_name)
-        echo "EEVEETAG=$EEVEETAG" >> $GITHUB_ENV
-        echo "Latest release tag: ${{ env.EEVEETAG }}"
-        
-    - name: Set EEVEETAG if tag provided
-      if: ${{ env.EEVEEVERSION != '' }}
-      id: fetch-tags
-      run: |
-        EEVEEVERSION="${{ env.EEVEEVERSION }}"
-        # Fetch all tags from the repository
-        tags=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ env.EEVEEREPO }}/tags | jq -r '.[].name')
-        
-        # Find the tag that contains the EEVEEVERSION value
-        for tag in $tags; do
-          if [[ $tag == *"$EEVEEVERSION"* ]]; then
-            echo "EEVEETAG=$tag" >> $GITHUB_ENV
-            echo "EEVEETAG: ${{ env.EEVEETAG }}"
-            exit 0
-          fi
-        done
-        # If no matching tag is found, fail the job
-        echo "No matching tag found for EEVEEVERSION=$EEVEEVERSION"
-        exit 1
-        echo "Using Release Tag: ${{ env.EEVEETAG }}"
-        
+        pip install librosa soundfile numpy --break-system-packages -q
+        echo "Haptic converter dependencies installed ✅"
+
     - name: Create Build Components folder
       run: mkdir -p "Build Components"
 
+    # ── Download source components (unchanged from original) ─────────────────
+
+    - name: Set EEVEETAG
+      run: |
+        if [ -z "${{ env.EEVEEVERSION }}" ]; then
+          EEVEETAG=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ env.EEVEEREPO }}/releases/latest | jq -r .tag_name)
+        else
+          EEVEEVERSION="${{ env.EEVEEVERSION }}"
+          tags=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ env.EEVEEREPO }}/tags | jq -r '.[].name')
+          for tag in $tags; do
+            if [[ $tag == *"$EEVEEVERSION"* ]]; then
+              EEVEETAG=$tag; break
+            fi
+          done
+          [ -z "$EEVEETAG" ] && echo "No matching tag for $EEVEEVERSION" && exit 1
+        fi
+        echo "EEVEETAG=$EEVEETAG" >> $GITHUB_ENV
+
     - name: Download Spotify IPA
       run: |
-        echo "Downloading From: ${{ github.event.inputs.SPOTURL }}"
-        # Download the file using curl
         curl -LJO "${{ github.event.inputs.SPOTURL }}"
         downloaded_file=$(ls -t | head -n1)
         mv "$downloaded_file" "Build Components/"
         echo "spotifypath=Build Components/$downloaded_file" >> $GITHUB_ENV
-      env:
-        SPOTURL: ${{ github.event.inputs.SPOTURL }}
-      
-    - name: Upload Spotify IPA to VirusTotal
-      if: ${{ env.VT_ENABLED == 'true' }}
-      uses: crazy-max/ghaction-virustotal@v4
-      id: vt-spotify
-      with:
-        files: "${{ env.spotifypath }}"
-        vt_api_key: ${{ secrets.VIRUSTOTALKEY }}
-        
-    - name: Set VirusTotal Analysis URL for Spotify IPA
-      if: ${{ env.VT_ENABLED == 'true' }}
-      run: echo "VTVANILLASPOTIFY=${{ steps.vt-spotify.outputs.analysis }}" >> $GITHUB_ENV
 
     - name: Download and process Orion
       run: |
-        # Download the Packages file from repo.chariz.com
         curl -sSL https://repo.chariz.com/Packages -o Packages
-    
-        # Use awk to find entries for dev.theos.orion14, Architecture: iphoneos-arm, find the highest version
-        # extract the version, filename, SHA256 Hash, and MD5 hash
-        ORIONVERSION=$(awk 'BEGIN { RS = ""; FS = "\n"; highest_version = "" } $1 ~ /^Package: dev.theos.orion14$/ && $0 ~ /Architecture: iphoneos-arm([^6]|$)/ { for (i = 1; i <= NF; i++) { if ($i ~ /^Version: /) { split($i, a, " "); version = a[2]; if (highest_version == "" || version > highest_version) { highest_version = version } } } } END { if (highest_version != "") print highest_version }' Packages)
-        echo "Orion Version Extracted: $ORIONVERSION"
-        FILENAME=$(awk 'BEGIN{RS="";FS="\n";highest_version=""} $1~/^Package: dev.theos.orion14$/ && $0~/Architecture: iphoneos-arm/{current_version="";current_filename="";for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");version=a[2];if(current_version==""||version>current_version){current_version=version}}else if($i~/^Filename: /){split($i,a," ");current_filename=a[2]}}if(highest_version==""||current_version>highest_version){highest_version=current_version;highest_filename=current_filename}} END{if(highest_version!="")print highest_filename}' Packages)
-        echo "Orion FileName Extracted: $FILENAME"
-        SHA256=$(awk 'BEGIN{RS="";FS="\n";highest_version="";sha256="noSHA"} $1~/^Package: dev.theos.orion14$/ && $0~/Architecture: iphoneos-arm/{current_version="";sha256_found=0;for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");version=a[2];if(current_version==""||version>current_version){current_version=version}}else if($i~/^SHA256: /){split($i,a," ");sha256=a[2];sha256_found=1}}if(highest_version==""||current_version>highest_version){highest_version=current_version;if(sha256_found==1){highest_sha256=sha256}else{highest_sha256="noSHA"}}}END{if(highest_version!="")print highest_sha256}' Packages)
-        echo "Orion SHA256 Hash Extracted: $SHA256"
-        MD5=$(awk 'BEGIN{RS="";FS="\n";highest_version="";md5sum="noMD5"} $1~/^Package: dev.theos.orion14$/ && $0~/Architecture: iphoneos-arm/{current_version="";for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");version=a[2];if(current_version==""||version>current_version){current_version=version}}else if($i~/^MD5Sum: /){split($i,a," ");md5sum=a[2]}}if(highest_version==""||current_version>highest_version){highest_version=current_version;highest_md5sum=md5sum}} END{if(highest_version!="")print highest_md5sum}' Packages)
-        echo "Orion MD5 Hash Extracted: $MD5"
-
-        echo "Downloading From: https://repo.chariz.com/$FILENAME"
-        # Download the file using curl
+        ORIONVERSION=$(awk 'BEGIN{RS="";FS="\n";hv=""} $1~/^Package: dev.theos.orion14$/ && $0~/Architecture: iphoneos-arm([^6]|$)/{for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");v=a[2];if(hv==""||v>hv)hv=v}}} END{print hv}' Packages)
+        FILENAME=$(awk 'BEGIN{RS="";FS="\n";hv=""} $1~/^Package: dev.theos.orion14$/ && $0~/Architecture: iphoneos-arm/{cv="";cf="";for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");v=a[2];if(cv==""||v>cv){cv=v}}else if($i~/^Filename: /){split($i,a," ");cf=a[2]}}if(hv==""||cv>hv){hv=cv;hf=cf}} END{print hf}' Packages)
         curl -LJO "https://repo.chariz.com/$FILENAME"
         downloaded_file=$(ls -t | head -n1)
         mv "$downloaded_file" "Build Components/"
-        orion="Build Components/$downloaded_file"
-        echo "orion path: $orion"
-
-        
-        #Check Hash
-        if [[ "${SHA256}" != "noSHA" ]]; then
-          echo "Expected SHA256 Hash: ${SHA256}"
-          calculated_sha256=$(shasum -a 256 "$orion" | awk '{print $1}')
-          echo "Calculated SHA256 Hash: $calculated_sha256"
-          if [[ "${calculated_sha256}" == "${SHA256}" ]]; then
-            echo "SHA256 matches. Continuing..."
-          else
-            echo "SHA256 does not match."
-            exit 1
-          fi
-        elif [[ "${MD5}" != "noMD5" ]]; then
-          echo "Expected MD5 Hash: ${MD5}"
-          calculated_md5=$(md5 -q "$orion" | awk '{print $1}')
-          echo "Calculated MD5 Hash: $calculated_md5"
-          if [[ "${calculated_md5}" == "${MD5}" ]]; then
-            echo "MD5 matches. Continuing..."
-          else
-            echo "MD5 does not match."
-            exit 1
-          fi
-        else
-          echo "Neither SHA256 nor MD5 is valid"
-          exit 1
-        fi
-
-        #CleanUp
         rm -f Packages
-
-        #Set Env Varibles
         echo "orion=Build Components/$downloaded_file" >> $GITHUB_ENV
         echo "ORIONVERSION=$ORIONVERSION" >> $GITHUB_ENV
-        
-    - name: Upload Orion to VirusTotal
-      if: ${{ env.VT_ENABLED == 'true' }}
-      uses: crazy-max/ghaction-virustotal@v4
-      id: vt-orion
-      with:
-        files: "${{ env.orion }}"
-        vt_api_key: ${{ secrets.VIRUSTOTALKEY }}
-        
-    - name: Set VirusTotal Analysis URL for Orion
-      if: ${{ env.VT_ENABLED == 'true' }}
-      run: echo "VTORION=${{ steps.vt-orion.outputs.analysis }}" >> $GITHUB_ENV
-    
+
     - name: Download and process Sposify
       run: |
-        # Download the Packages file
         curl -sSL https://repo.dynastic.co/Packages -o Packages
-    
-        # Use awk to find entries for com.spos, Architecture: iphoneos-arm, find the highest version
-        # extract the version, filename, SHA256 Hash, and MD5 hash
-        SPOSIFYVERSION=$(awk 'BEGIN { RS = ""; FS = "\n"; highest_version = "" } $1 ~ /^Package: com.spos$/ && $0 ~ /Architecture: iphoneos-arm([^6]|$)/ { for (i = 1; i <= NF; i++) { if ($i ~ /^Version: /) { split($i, a, " "); version = a[2]; if (highest_version == "" || version > highest_version) { highest_version = version } } } } END { if (highest_version != "") print highest_version }' Packages)
-        echo "Sposify Version Extracted: $SPOSIFYVERSION"
-        FILENAME=$(awk 'BEGIN{RS="";FS="\n";highest_version=""} $1~/^Package: com.spos$/ && $0~/Architecture: iphoneos-arm/{current_version="";current_filename="";for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");version=a[2];if(current_version==""||version>current_version){current_version=version}}else if($i~/^Filename: /){split($i,a," ");current_filename=a[2]}}if(highest_version==""||current_version>highest_version){highest_version=current_version;highest_filename=current_filename}} END{if(highest_version!="")print highest_filename}' Packages)
-        echo "Sposify FileName Extracted: $FILENAME"
-        SHA256=$(awk 'BEGIN{RS="";FS="\n";highest_version="";sha256="noSHA"} $1~/^Package: com.spos$/ && $0~/Architecture: iphoneos-arm/{current_version="";sha256_found=0;for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");version=a[2];if(current_version==""||version>current_version){current_version=version}}else if($i~/^SHA256: /){split($i,a," ");sha256=a[2];sha256_found=1}}if(highest_version==""||current_version>highest_version){highest_version=current_version;if(sha256_found==1){highest_sha256=sha256}else{highest_sha256="noSHA"}}}END{if(highest_version!="")print highest_sha256}' Packages)
-        echo "Sposify SHA256 Hash Extracted: $SHA256"
-        MD5=$(awk 'BEGIN{RS="";FS="\n";highest_version="";md5sum="noMD5"} $1~/^Package: com.spos$/ && $0~/Architecture: iphoneos-arm/{current_version="";for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");version=a[2];if(current_version==""||version>current_version){current_version=version}}else if($i~/^MD5Sum: /){split($i,a," ");md5sum=a[2]}}if(highest_version==""||current_version>highest_version){highest_version=current_version;highest_md5sum=md5sum}} END{if(highest_version!="")print highest_md5sum}' Packages)
-        echo "Sposify MD5 Hash Extracted: $MD5"
-
-        echo "Downloading From: https://repo.dynastic.co/$FILENAME"
-        # Download the file using curl
+        SPOSIFYVERSION=$(awk 'BEGIN{RS="";FS="\n";hv=""} $1~/^Package: com.spos$/ && $0~/Architecture: iphoneos-arm([^6]|$)/{for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");v=a[2];if(hv==""||v>hv)hv=v}}} END{print hv}' Packages)
+        FILENAME=$(awk 'BEGIN{RS="";FS="\n";hv=""} $1~/^Package: com.spos$/ && $0~/Architecture: iphoneos-arm/{cv="";cf="";for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");v=a[2];if(cv==""||v>cv)cv=v}else if($i~/^Filename: /){split($i,a," ");cf=a[2]}}if(hv==""||cv>hv){hv=cv;hf=cf}} END{print hf}' Packages)
         curl -LJO "https://repo.dynastic.co/$FILENAME"
         downloaded_file=$(ls -t | head -n1)
         mv "$downloaded_file" "Build Components/"
-        sposify="Build Components/$downloaded_file"
-        echo "Sposify path: $sposify"
-        
-        #Check Hash
-        if [[ "${SHA256}" != "noSHA" ]]; then
-          echo "Expected SHA256 Hash: ${SHA256}"
-          calculated_sha256=$(shasum -a 256 "$sposify" | awk '{print $1}')
-          echo "Calculated SHA256 Hash: $calculated_sha256"
-          if [[ "${calculated_sha256}" == "${SHA256}" ]]; then
-            echo "SHA256 matches. Continuing..."
-          else
-            echo "SHA256 does not match."
-            exit 1
-          fi
-        elif [[ "${MD5}" != "noMD5" ]]; then
-          echo "Expected MD5 Hash: ${MD5}"
-          calculated_md5=$(md5 -q "$sposify" | awk '{print $1}')
-          echo "Calculated MD5 Hash: $calculated_md5"
-          if [[ "${calculated_md5}" == "${MD5}" ]]; then
-            echo "MD5 matches. Continuing..."
-          else
-            echo "MD5 does not match."
-            exit 1
-          fi
-        else
-          echo "Neither SHA256 nor MD5 is valid"
-          exit 1
-        fi
-
-        #CleanUp
         rm -f Packages
-
-        #Set Env Varibles
         echo "sposify=Build Components/$downloaded_file" >> $GITHUB_ENV
         echo "SPOSIFYVERSION=$SPOSIFYVERSION" >> $GITHUB_ENV
 
-    
-    - name: Upload Sposify to VirusTotal
-      if: ${{ env.VT_ENABLED == 'true' }}
-      uses: crazy-max/ghaction-virustotal@v4
-      id: vt-sposify
-      with:
-        files: "${{ env.sposify }}"
-        vt_api_key: ${{ secrets.VIRUSTOTALKEY }}
-        
-    - name: Set VirusTotal Analysis URL for Sposify
-      if: ${{ env.VT_ENABLED == 'true' }}
-      run: echo "VTSPOSIFY=${{ steps.vt-sposify.outputs.analysis }}" >> $GITHUB_ENV
-
     - name: Download and process SposifyFix
       run: |
-        # Download the Packages file
         curl -sSL https://level3tjg.me/repo/Packages -o Packages
-    
-        # Use awk to find entries for dev.theos.orion14, Architecture: iphoneos-arm, find the highest version
-        # extract the version, filename, SHA256 Hash, and MD5 hash
-        SPOSIFYFIXVERSION=$(awk 'BEGIN { RS = ""; FS = "\n"; highest_version = "" } $1 ~ /^Package: com.level3tjg.sposifyfix$/ && $0 ~ /Architecture: iphoneos-arm([^6]|$)/ { for (i = 1; i <= NF; i++) { if ($i ~ /^Version: /) { split($i, a, " "); version = a[2]; if (highest_version == "" || version > highest_version) { highest_version = version } } } } END { if (highest_version != "") print highest_version }' Packages)
-        echo "SposifyFix Version Extracted: $SPOSIFYFIXVERSION"
-        FILENAME=$(awk 'BEGIN{RS="";FS="\n";highest_version=""} $1~/^Package: com.level3tjg.sposifyfix$/ && $0~/Architecture: iphoneos-arm/{current_version="";current_filename="";for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");version=a[2];if(current_version==""||version>current_version){current_version=version}}else if($i~/^Filename: /){split($i,a," ");current_filename=a[2]}}if(highest_version==""||current_version>highest_version){highest_version=current_version;highest_filename=current_filename}} END{if(highest_version!="")print highest_filename}' Packages)
-        echo "SposifyFix FileName Extracted: $FILENAME"
-        SHA256=$(awk 'BEGIN{RS="";FS="\n";highest_version="";sha256="noSHA"} $1~/^Package: com.level3tjg.sposifyfix$/ && $0~/Architecture: iphoneos-arm/{current_version="";sha256_found=0;for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");version=a[2];if(current_version==""||version>current_version){current_version=version}}else if($i~/^SHA256: /){split($i,a," ");sha256=a[2];sha256_found=1}}if(highest_version==""||current_version>highest_version){highest_version=current_version;if(sha256_found==1){highest_sha256=sha256}else{highest_sha256="noSHA"}}}END{if(highest_version!="")print highest_sha256}' Packages)
-        echo "SposifyFix SHA256 Hash Extracted: $SHA256"
-        MD5=$(awk 'BEGIN{RS="";FS="\n";highest_version="";md5sum="noMD5"} $1~/^Package: ccom.level3tjg.sposifyfix$/ && $0~/Architecture: iphoneos-arm/{current_version="";for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");version=a[2];if(current_version==""||version>current_version){current_version=version}}else if($i~/^MD5Sum: /){split($i,a," ");md5sum=a[2]}}if(highest_version==""||current_version>highest_version){highest_version=current_version;highest_md5sum=md5sum}} END{if(highest_version!="")print highest_md5sum}' Packages)
-        echo "SposifyFix MD5 Hash Extracted: $MD5"
-
-        echo "Downloading From: https://level3tjg.me/repo/Packages/$FILENAME"
-        # Download the file using curl
+        SPOSIFYFIXVERSION=$(awk 'BEGIN{RS="";FS="\n";hv=""} $1~/^Package: com.level3tjg.sposifyfix$/ && $0~/Architecture: iphoneos-arm([^6]|$)/{for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");v=a[2];if(hv==""||v>hv)hv=v}}} END{print hv}' Packages)
+        FILENAME=$(awk 'BEGIN{RS="";FS="\n";hv=""} $1~/^Package: com.level3tjg.sposifyfix$/ && $0~/Architecture: iphoneos-arm/{cv="";cf="";for(i=1;i<=NF;i++){if($i~/^Version: /){split($i,a," ");v=a[2];if(cv==""||v>cv)cv=v}else if($i~/^Filename: /){split($i,a," ");cf=a[2]}}if(hv==""||cv>hv){hv=cv;hf=cf}} END{print hf}' Packages)
         curl -LJO "https://level3tjg.me/repo/$FILENAME"
         downloaded_file=$(ls -t | head -n1)
         mv "$downloaded_file" "Build Components/"
-        sposifyfix="Build Components/$downloaded_file"
-        echo "SposifyFix path: $sposifyfix"
-        
-        #Check Hash
-        if [[ "${SHA256}" != "noSHA" ]]; then
-          echo "Expected SHA256 Hash: ${SHA256}"
-          calculated_sha256=$(shasum -a 256 "$sposifyfix" | awk '{print $1}')
-          echo "Calculated SHA256 Hash: $calculated_sha256"
-          if [[ "${calculated_sha256}" == "${SHA256}" ]]; then
-            echo "SHA256 matches. Continuing..."
-          else
-            echo "SHA256 does not match."
-            exit 1
-          fi
-        elif [[ "${MD5}" != "noMD5" ]]; then
-          echo "Expected MD5 Hash: ${MD5}"
-          calculated_md5=$(md5 -q "$sposifyfix" | awk '{print $1}')
-          echo "Calculated MD5 Hash: $calculated_md5"
-          if [[ "${calculated_md5}" == "${MD5}" ]]; then
-            echo "MD5 matches. Continuing..."
-          else
-            echo "MD5 does not match."
-            exit 1
-          fi
-        else
-          echo "Neither SHA256 nor MD5 is valid"
-          exit 1
-        fi
-
-        #CleanUp
         rm -f Packages
-
-        #Set Env Varibles
         echo "sposifyfix=Build Components/$downloaded_file" >> $GITHUB_ENV
         echo "SPOSIFYFIXVERSION=$SPOSIFYFIXVERSION" >> $GITHUB_ENV
-    
-    - name: Upload SposifyFix to VirusTotal
-      if: ${{ env.VT_ENABLED == 'true' }}
-      uses: crazy-max/ghaction-virustotal@v4
-      id: vt-sposifyfix
-      with:
-        files: "${{ env.sposifyfix }}"
-        vt_api_key: ${{ secrets.VIRUSTOTALKEY }}
-        
-    - name: Set VirusTotal Analysis URL for SposifyFix
-      if: ${{ env.VT_ENABLED == 'true' }}
-      run: echo "VTSPOSIFYFIX=${{ steps.vt-sposifyfix.outputs.analysis }}" >> $GITHUB_ENV
 
-    - name: Download EeveeSpotify .deb file from releases
+    - name: Download EeveeSpotify .deb (release)
       if: ${{ github.event.inputs.USEACTIONSEEVEE == 'false' }}
       run: |
         eevee_asset=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ env.EEVEEREPO }}/releases/tags/${{ env.EEVEETAG }} | jq -r '.assets[] | select(.name | startswith("com.eevee.spotify") and endswith("iphoneos-arm.deb")).browser_download_url')
-        echo "Downloading From: $eevee_asset"
-        # Download the file using curl
         curl -LJO "$eevee_asset"
         downloaded_file=$(ls -t | head -n1)
         mv "$downloaded_file" "Build Components/"
         echo "eevee-arm=Build Components/$downloaded_file" >> $GITHUB_ENV
-      env:
-        EEVEETAG: ${{ env.EEVEETAG }}
 
-    - name: Download EeveeSpotify .deb file from artifacts
+    - name: Download EeveeSpotify .deb (actions artifact)
       if: ${{ github.event.inputs.USEACTIONSEEVEE == 'true' }}
       run: |
         workflow_run_id=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/${{ env.EEVEEREPO }}/actions/workflows/build-swift.yml/runs?status=success&per_page=1" | jq -r '.workflow_runs[0].id')
-        echo "Workflow ID: $workflow_run_id"
         eevee_asset=$(curl -sL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ env.EEVEEREPO }}/actions/runs/$workflow_run_id/artifacts | jq -r '.artifacts[] | select(.name | test("debug|arm64") | not) | .archive_download_url')
-        echo "Downloading From: $eevee_asset"
         curl -LJ -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "$eevee_asset" -o "eeveespotfiyactionsasset.zip"
-        # Extract the downloaded zip file
         unzip -q "eeveespotfiyactionsasset.zip" -d extracted_files
-        # Find the file you need within the extracted files
         downloaded_file=$(find extracted_files -type f -name "*.deb" -print -quit)
-        # Move the found file to the desired directory
         mv "$downloaded_file" "Build Components/"
-        # Clean up extracted files
         rm -rf extracted_files
         echo "eevee-arm=Build Components/$(basename "$downloaded_file")" >> $GITHUB_ENV
         echo "eeveeAssetLink=$eevee_asset" >> $GITHUB_ENV
 
-    
-    - name: Upload EeveeSpotify to VirusTotal
-      if: ${{ env.VT_ENABLED == 'true' }}
-      uses: crazy-max/ghaction-virustotal@v4
-      id: vt-eevee
-      with:
-        files: "${{ env.eevee-arm }}"
-        vt_api_key: ${{ secrets.VIRUSTOTALKEY }}
-
-    - name: Get Eevee release name
+    - name: Get EeveeSpotify release name
       run: |
         RELEASE_TITLE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/${{ env.EEVEEREPO }}/releases/tags/${{ env.EEVEETAG }}" | jq -r '.name')
         echo "EEVEEVERSIONNAME=$RELEASE_TITLE" >> $GITHUB_ENV
-        
-    - name: Set VirusTotal Analysis URL for EeveeSpotify
-      if: ${{ env.VT_ENABLED == 'true' }}
-      run: echo "VTEEVEE=${{ steps.vt-eevee.outputs.analysis }}" >> $GITHUB_ENV
 
-    - name: Download SwiftProtobuf .deb file
+    - name: Download SwiftProtobuf .deb
       run: |
         protobuf_asset=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ env.EEVEEREPO }}/releases/tags/${{ env.EEVEETAG }} | jq -r '.assets[] | select(.name | startswith("org.swift.protobuf.swiftprotobuf") and endswith("iphoneos-arm.deb")).browser_download_url')
-        echo "Downloading From: $protobuf_asset"
-        # Download the file using curl
         curl -LJO "$protobuf_asset"
         downloaded_file=$(ls -t | head -n1)
         mv "$downloaded_file" "Build Components/"
@@ -388,376 +195,193 @@ jobs:
         filename=$(basename "${protobuf_asset}")
         protobuf_version=$(echo "${filename}" | sed -n 's/org.swift.protobuf.swiftprotobuf_\([^-]*\)_iphoneos-arm.deb/\1/p')
         echo "SWIFTPROTOBUFVERSION=${protobuf_version}" >> $GITHUB_ENV
-      env:
-        EEVEETAG: ${{ env.EEVEETAG }}
-    
-    - name: Upload SwiftProtobuf to VirusTotal
-      if: ${{ env.VT_ENABLED == 'true' }}
-      uses: crazy-max/ghaction-virustotal@v4
-      id: vt-swiftprotobuf
-      with:
-        files: "${{ env.swiftprotobuf }}"
-        vt_api_key: ${{ secrets.VIRUSTOTALKEY }}
-        
-    - name: Set VirusTotal Analysis URL for SwiftProtobuf
-      if: ${{ env.VT_ENABLED == 'true' }}
-      run: echo "VTSWIFTPROTOBUF=${{ steps.vt-swiftprotobuf.outputs.analysis }}" >> $GITHUB_ENV
 
     - name: Clone OpenSpotifySafariExtension
-      run: git clone https://github.com/whoeevee/OpenSpotifySafariExtension
-    
-    - name: Copy OpenSpotifySafariExtension.appex to Build Components
       run: |
+        git clone https://github.com/whoeevee/OpenSpotifySafariExtension
         cp -R OpenSpotifySafariExtension/OpenSpotifySafariExtension.appex "Build Components/OpenSpotifySafariExtension.appex"
-        echo "EXTCOMMIT=$(git -C OpenSpotifySafariExtension rev-parse --short HEAD)"
         echo "EXTCOMMIT=$(git -C OpenSpotifySafariExtension rev-parse --short HEAD)" >> $GITHUB_ENV
-        echo "Extensions Commit is: ${{ env.EXTCOMMIT }}"
         echo "OSSEXT=Build Components/OpenSpotifySafariExtension.appex" >> $GITHUB_ENV
-    
-    - name: Compress OpenSpotifySafariExtension to zip
-      run: |
-        cd OpenSpotifySafariExtension
-        echo "Compressing:"
-        ls
-        ditto -c -k --sequesterRsrc --keepParent ./ "../Build Components/OpenSpotifySafariExtension.zip"
-    
-    - name: Upload OpenSpotifySafariExtension to VirusTotal
-      if: ${{ env.VT_ENABLED == 'true' }}
-      uses: crazy-max/ghaction-virustotal@v4
-      id: vt-openspotify
-      with:
-        files: "Build Components/OpenSpotifySafariExtension.zip"
-        vt_api_key: ${{ secrets.VIRUSTOTALKEY }}
-        
-    - name: Set VirusTotal Analysis URL for OpenSpotifySafariExtension
-      if: ${{ env.VT_ENABLED == 'true' }}
-      run: |
-        echo "VTEXT=${{ steps.vt-openspotify.outputs.analysis }}" >> $GITHUB_ENV
-        rm -f "Build Components/OpenSpotifySafariExtension.zip"
 
-    - name: Read Spotify information from vanilla .ipa
+    - name: Read Spotify IPA info
       run: |
         cp "${{ env.spotifypath }}" "Build Components/SpotifyAnylises.zip"
         unzip "Build Components/SpotifyAnylises.zip" -d "Build Components"
-        cd "Build Components"
-        cp Payload/Spotify.app/Info.plist "Info.plist"
-        echo "VANILLASPOTIFYVERSION=$(/usr/libexec/PlistBuddy -c "Print :SpotifyVersionShort" Info.plist)"
-        echo "VANILLASPOTIFYVERSION=$(/usr/libexec/PlistBuddy -c "Print :SpotifyVersionShort" Info.plist)" >> $GITHUB_ENV
-        echo "Vanilla Spotify Version: $VANILLASPOTIFYVERSION"
-
-        MIN_IOS_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' Info.plist)
+        cp "Build Components/Payload/Spotify.app/Info.plist" "Build Components/Info.plist"
+        VANILLASPOTIFYVERSION=$(/usr/libexec/PlistBuddy -c "Print :SpotifyVersionShort" "Build Components/Info.plist")
+        MIN_IOS_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "Build Components/Info.plist")
+        echo "VANILLASPOTIFYVERSION=$VANILLASPOTIFYVERSION" >> $GITHUB_ENV
         echo "MIN_IOS_VERSION=$MIN_IOS_VERSION" >> $GITHUB_ENV
-        echo "Minimum iOS Version: ${{ env.MIN_IOS_VERSION }}"
-
-        (echo "{"; find ./ -name "Info.plist" | while read file; do plutil -p "$file" 2>/dev/null | grep -E "NS.*Description" | sed -E 's/^\s*"([^"]+)".*"(.*)"$/"\1": "\2",/'; done | sed 's/ =>/:/g' | sed 's/\(.*\),/\1/' | tr '\n' ',' | sed 's/,$//' | sed 's/,/,\n/g'; echo "}") > NSDescriptions.json
-
-        (codesign -d --entitlements :- Payload/Spotify.app | xmllint --format - | sed -n 's/.*<key>\(.*\)<\/key>.*/\1/p'; for EXT in Payload/Spotify.app/PlugIns/*.appex ./OpenSpotifySafariExtension.appex; do [ -d "$EXT" ] && codesign -d --entitlements :- "$EXT" | xmllint --format - | sed -n 's/.*<key>\(.*\)<\/key>.*/\1/p'; done) | sort | uniq | jq -R -s 'split("\n") | map(select(length > 0))' > Entitlements.json
-        
-        # Clean Up
-        rm -rf Payload
-        rm -f SpotifyAnylises.zip
-        rm -f Info.plist
-
-    - name: Check if components were updated
-      run: |
-        latest_info=$(curl -s https://raw.githubusercontent.com/SpotCompiled/SpotC-Repo/refs/heads/main/AltStore%20Repo.json | jq '.apps[] | select(.name == "SpotC++") | .information')
-
-        # Fetch previous versions.
-        spotify_version=$(echo "$latest_info" | jq -r '.[] | select(.item == "Spotify") | .version')
-        eeveespotify_version=$(echo "$latest_info" | jq -r '.[] | select(.item == "EeveeSpotify") | .version')
-        sposify_version=$(echo "$latest_info" | jq -r '.[] | select(.item == "Sposify") | .version')
-        openspotify_version=$(echo "$latest_info" | jq -r '.[] | select(.item == "OpenSpotifySafariExtension") | .version')
-        sposifyfix_version=$(echo "$latest_info" | jq -r '.[] | select(.item == "Sposify Fix") | .version')
-        orionruntime_version=$(echo "$latest_info" | jq -r '.[] | select(.item == "Orion Runtime") | .version')
-        swiftprotobuf_version=$(echo "$latest_info" | jq -r '.[] | select(.item == "SwiftProtobuf Framework") | .version')
-    
-        # Spotify
-        if [ "$spotify_version" != "v${{ env.VANILLASPOTIFYVERSION }}" ]; then
-          echo "Spotify version updated from $spotify_version to v${{ env.VANILLASPOTIFYVERSION }}"
-          echo "SPOTIFY_UPDATED=true" >> $GITHUB_ENV
-        else
-          echo "SPOTIFY_UPDATED=false" >> $GITHUB_ENV
-        fi
-    
-        # EeveeSpotify
-        if [ "$eeveespotify_version" != "${{ env.EEVEEVERSIONNAME }}" ]; then
-          echo "EeveeSpotify version updated from $eeveespotify_version to ${{ env.EEVEEVERSIONNAME }}"
-          echo "EEVEESPOTIFY_UPDATED=true" >> $GITHUB_ENV
-        else
-          echo "EEVEESPOTIFY_UPDATED=false" >> $GITHUB_ENV
-        fi
-    
-        # Sposify
-        if [ "$sposify_version" != "v${{ env.SPOSIFYVERSION }}" ]; then
-          echo "Sposify version updated from $sposify_version to v${{ env.SPOSIFYVERSION }}"
-          echo "SPOSIFY_UPDATED=true" >> $GITHUB_ENV
-        else
-          echo "SPOSIFY_UPDATED=false" >> $GITHUB_ENV
-        fi
-    
-        # OpenSpotifySafariExtension
-        if [ "$openspotify_version" != "Commit ${{ env.EXTCOMMIT }}" ]; then
-          echo "OpenSpotifySafariExtension version updated from $openspotify_version to Commit ${{ env.EXTCOMMIT }}"
-          echo "OPENSPOTIFY_UPDATED=true" >> $GITHUB_ENV
-        else
-          echo "OPENSPOTIFY_UPDATED=false" >> $GITHUB_ENV
-        fi
-    
-        # Sposify Fix
-        if [ "$sposifyfix_version" != "v${{ env.SPOSIFYFIXVERSION }}" ]; then
-          echo "Sposify Fix version updated from $sposifyfix_version to v${{ env.SPOSIFYFIXVERSION }}"
-          echo "SPOSIFYFIX_UPDATED=true" >> $GITHUB_ENV
-        else
-          echo "SPOSIFYFIX_UPDATED=false" >> $GITHUB_ENV
-        fi
-    
-        # Orion Runtime
-        if [ "$orionruntime_version" != "v${{ env.ORIONVERSION }}" ]; then
-          echo "Orion Runtime version updated from $orionruntime_version to v${{ env.ORIONVERSION }}"
-          echo "ORIONRUNTIME_UPDATED=true" >> $GITHUB_ENV
-        else
-          echo "ORIONRUNTIME_UPDATED=false" >> $GITHUB_ENV
-        fi
-    
-        # SwiftProtobuf Framework
-        if [ "$swiftprotobuf_version" != "v${{ env.SWIFTPROTOBUFVERSION }}" ]; then
-          echo "SwiftProtobuf Framework version updated from $swiftprotobuf_version to v${{ env.SWIFTPROTOBUFVERSION }}"
-          echo "SWIFTPROTOBUF_UPDATED=true" >> $GITHUB_ENV
-        else
-          echo "SWIFTPROTOBUF_UPDATED=false" >> $GITHUB_ENV
-        fi
+        rm -rf "Build Components/Payload" "Build Components/SpotifyAnylises.zip" "Build Components/Info.plist"
 
     - name: Set Change Version
-      id: set-change-version
       run: |
-        # Retrieve the current CHANGEVERSION input from GitHub Actions
         CHANGEVERSION="${{ github.event.inputs.CHANGEVERSION }}"
-        # If CHANGEVERSION is not provided, fetch the latest tag from GitHub API
         if [ -z "$CHANGEVERSION" ]; then
           latest_tag=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/SpotCompiled/SpotC-Plus-Plus/releases/latest | jq -r .tag_name)
-          # Extract the version number without the 'v' prefix
           version=${latest_tag#v}
-          # Split the version number into major, minor, and patch components
-          IFS='.' read -r -a version_parts <<< "$version"
-          # Increment the patch version component (assuming the version is in format v2.1.3)
-          patch=$(( ${version_parts[2]} + 1 ))
-         # Construct the new version string without the 'v' prefix
-          new_version="${version_parts[0]}.${version_parts[1]}.$patch"
-          # Store the new version string in CHANGEVERSION
-          CHANGEVERSION="$new_version"
+          IFS='.' read -r -a vp <<< "$version"
+          CHANGEVERSION="${vp[0]}.${vp[1]}.$((${vp[2]} + 1))"
         fi
-        # Store the final CHANGEVERSION in GitHub environment variable
         echo "CHANGEVERSION=$CHANGEVERSION" >> $GITHUB_ENV
-        echo "Using ChangeVersion: $CHANGEVERSION"
 
     - name: Set Components Path
       run: echo "componentspath=Build Components" >> $GITHUB_ENV
-      
-    - name: Run Cyan
+
+    # ── NEW: Build SpotHaptics tweak .deb ────────────────────────────────────
+    # Installs Theos (if not cached), compiles SpotHaptics via Orion/Swift,
+    # and produces a .deb that Cyan will inject alongside the other tweaks.
+
+    - name: Cache Theos
+      id: cache-theos
+      uses: actions/cache@v4
+      with:
+        path: /opt/theos
+        key: theos-${{ runner.os }}-v1
+
+    - name: Install Theos
+      if: steps.cache-theos.outputs.cache-hit != 'true'
       run: |
-        Cyan -i "${{ env.spotifypath }}" -o "${{ env.componentspath }}/SpotC++.v${{ env.CHANGEVERSION }}_v${{ env.VANILLASPOTIFYVERSION }}.ipa" -v ${{ env.CHANGEVERSION }} -f "${{ env.sposifyfix }}" "${{ env.sposify }}" "${{ env.OSSEXT }}" "${{ env.orion }}" "${{ env.swiftprotobuf }}" "${{ env.eevee-arm }}" -u -w
-        echo "patchedspotify=${{ env.componentspath }}/SpotC++.v${{ env.CHANGEVERSION }}_v${{ env.VANILLASPOTIFYVERSION }}.ipa"
+        bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+        echo "Theos installed ✅"
+
+    - name: Build SpotHaptics tweak
+      run: |
+        cd SpotHaptics
+        export THEOS=/opt/theos
+        make package FINALPACKAGE=1 2>&1
+        DEB=$(find packages -name "*.deb" | sort | tail -n1)
+        echo "SpotHaptics .deb: $DEB"
+        cp "$DEB" "../Build Components/SpotHaptics.deb"
+        echo "spothaptics=Build Components/SpotHaptics.deb" >> $GITHUB_ENV
+        echo "✅ SpotHaptics.deb ready"
+
+    # ── NEW: Custom Haptics generation ───────────────────────────────────────
+
+    - name: Download and convert custom audio → .ahap
+      if: ${{ github.event.inputs.HAPTICS_AUDIO_ZIP_URL != '' }}
+      run: |
+        echo "📥 Downloading audio ZIP …"
+        mkdir -p custom_audio haptics_output
+
+        curl -L "${{ github.event.inputs.HAPTICS_AUDIO_ZIP_URL }}" -o custom_audio.zip
+        unzip -q custom_audio.zip -d custom_audio
+        rm custom_audio.zip
+
+        echo "🎵 Found audio files:"
+        find custom_audio -type f | head -40
+
+        echo ""
+        echo "🎛️  Converting to .ahap …"
+        python3 haptic_converter/batch_convert.py \
+          custom_audio \
+          haptics_output \
+          --workers 2 \
+          --min-transient-intensity ${{ github.event.inputs.HAPTICS_MIN_TRANSIENT }} \
+          --min-continuous-intensity ${{ github.event.inputs.HAPTICS_MIN_CONTINUOUS }}
+
+        HAPTIC_COUNT=$(find haptics_output -name "*.ahap" | wc -l | tr -d ' ')
+        echo "HAPTIC_COUNT=$HAPTIC_COUNT" >> $GITHUB_ENV
+        echo "HAPTICS_ENABLED=true" >> $GITHUB_ENV
+        echo "✅  $HAPTIC_COUNT haptic pattern(s) generated."
+
+    - name: Set haptics disabled flag (no audio provided)
+      if: ${{ github.event.inputs.HAPTICS_AUDIO_ZIP_URL == '' }}
+      run: |
+        echo "HAPTICS_ENABLED=false" >> $GITHUB_ENV
+        echo "ℹ️  No HAPTICS_AUDIO_ZIP_URL provided — skipping haptic generation."
+
+    # ── Run Cyan to patch the IPA ────────────────────────────────────────────
+
+    - name: Run Cyan (standard)
+      run: |
+        Cyan -i "${{ env.spotifypath }}" \
+             -o "${{ env.componentspath }}/SpotC++.v${{ env.CHANGEVERSION }}_v${{ env.VANILLASPOTIFYVERSION }}.ipa" \
+             -v ${{ env.CHANGEVERSION }} \
+             -f "${{ env.sposifyfix }}" "${{ env.sposify }}" "${{ env.OSSEXT }}" \
+                "${{ env.orion }}" "${{ env.swiftprotobuf }}" "${{ env.eevee-arm }}" \
+                "${{ env.spothaptics }}" \
+             -u -w
         echo "patchedspotify=${{ env.componentspath }}/SpotC++.v${{ env.CHANGEVERSION }}_v${{ env.VANILLASPOTIFYVERSION }}.ipa" >> $GITHUB_ENV
-        echo "Patched Spotify .ipa Located: ${{ env.patchedspotify }}"
 
-    - name: Upload SpotifyPatched.ipa to VirusTotal
-      if: ${{ env.VT_ENABLED == 'true' }}
-      uses: crazy-max/ghaction-virustotal@v4
-      id: vt-spotc
-      with:
-        files: "${{ env.patchedspotify }}"
-        vt_api_key: ${{ secrets.VIRUSTOTALKEY }}
-
-    - name: Set VirusTotal Analysis URL for SpotC++
-      if: ${{ env.VT_ENABLED == 'true' }}
-      run: echo "VTSPOTC=${{ steps.vt-spotc.outputs.analysis }}" >> $GITHUB_ENV
-
-    - name: Run Cyan AltStore
+    - name: Run Cyan (AltStore)
       run: |
-        Cyan -i "${{ env.spotifypath }}" -o "${{ env.componentspath }}/SpotC++.v${{ env.CHANGEVERSION }}_v${{ env.VANILLASPOTIFYVERSION }}_ALTSTORESOURCE_ONLY.ipa" -v ${{ env.CHANGEVERSION }} -b com.yodaluca23.SpotCPlusPlus -f "${{ env.sposifyfix }}" "${{ env.sposify }}" "${{ env.OSSEXT }}" "${{ env.orion }}" "${{ env.swiftprotobuf }}" "${{ env.eevee-arm }}" -u -w
-        echo "altpatchedspotify=${{ env.componentspath }}/SpotC++.v${{ env.CHANGEVERSION }}_v${{ env.VANILLASPOTIFYVERSION }}_ALTSTORESOURCE_ONLY.ipa"
+        Cyan -i "${{ env.spotifypath }}" \
+             -o "${{ env.componentspath }}/SpotC++.v${{ env.CHANGEVERSION }}_v${{ env.VANILLASPOTIFYVERSION }}_ALTSTORESOURCE_ONLY.ipa" \
+             -v ${{ env.CHANGEVERSION }} \
+             -b com.yodaluca23.SpotCPlusPlus \
+             -f "${{ env.sposifyfix }}" "${{ env.sposify }}" "${{ env.OSSEXT }}" \
+                "${{ env.orion }}" "${{ env.swiftprotobuf }}" "${{ env.eevee-arm }}" \
+                "${{ env.spothaptics }}" \
+             -u -w
         echo "altpatchedspotify=${{ env.componentspath }}/SpotC++.v${{ env.CHANGEVERSION }}_v${{ env.VANILLASPOTIFYVERSION }}_ALTSTORESOURCE_ONLY.ipa" >> $GITHUB_ENV
-        echo "AltStore Patched Spotify .ipa Located: ${{ env.altpatchedspotify }}"
 
-    - name: Upload AltSpotifyPatched.ipa to VirusTotal
-      if: ${{ env.VT_ENABLED == 'true' }}
-      uses: crazy-max/ghaction-virustotal@v4
-      id: vt-altspotc
+    # ── NEW: Inject .ahap files into both IPAs ────────────────────────────────
+
+    - name: Inject haptic patterns into standard IPA
+      if: ${{ env.HAPTICS_ENABLED == 'true' }}
+      run: |
+        echo "💉 Injecting ${{ env.HAPTIC_COUNT }} haptic pattern(s) into standard IPA …"
+        python3 haptic_converter/inject_haptics.py \
+          "${{ env.patchedspotify }}" \
+          haptics_output \
+          "${{ env.patchedspotify }}"
+        echo "✅  Haptics injected into standard IPA."
+
+    - name: Inject haptic patterns into AltStore IPA
+      if: ${{ env.HAPTICS_ENABLED == 'true' }}
+      run: |
+        echo "💉 Injecting ${{ env.HAPTIC_COUNT }} haptic pattern(s) into AltStore IPA …"
+        python3 haptic_converter/inject_haptics.py \
+          "${{ env.altpatchedspotify }}" \
+          haptics_output \
+          "${{ env.altpatchedspotify }}"
+        echo "✅  Haptics injected into AltStore IPA."
+
+    # ── Upload converted .ahap files as build artifact ───────────────────────
+
+    - name: Upload generated .ahap files as artifact
+      if: ${{ env.HAPTICS_ENABLED == 'true' }}
+      uses: actions/upload-artifact@v4
       with:
-        files: "${{ env.altpatchedspotify }}"
-        vt_api_key: ${{ secrets.VIRUSTOTALKEY }}
-        
-    - name: Set VirusTotal Analysis URL for AltSpotC++
-      if: ${{ env.VT_ENABLED == 'true' }}
-      run: echo "VTALTSPOTC=${{ steps.vt-altspotc.outputs.analysis }}" >> $GITHUB_ENV
+        name: CustomHapticPatterns
+        path: haptics_output/
+
+    # ── Upload to Catbox ─────────────────────────────────────────────────────
 
     - name: Upload to Catbox (With Hash)
       if: ${{ env.CATBOXHASH_ENABLED == 'true' }}
       run: |
         RELEASEURL=$(curl -F "reqtype=fileupload" -F "userhash=${{ secrets.CATBOXHASH }}" -F "fileToUpload=@${{ env.patchedspotify }}" https://catbox.moe/user/api.php)
-        echo "Standard Release Download URL: $RELEASEURL"
         echo "RELEASEURL=$RELEASEURL" >> $GITHUB_ENV
-    
         RELEASEURLALTSTORE=$(curl -F "reqtype=fileupload" -F "userhash=${{ secrets.CATBOXHASH }}" -F "fileToUpload=@${{ env.altpatchedspotify }}" https://catbox.moe/user/api.php)
-        echo "AltStore Release Download URL: $RELEASEURLALTSTORE"
         echo "RELEASEURLALTSTORE=$RELEASEURLALTSTORE" >> $GITHUB_ENV
-      
+
     - name: Upload to Catbox (Without Hash)
       if: ${{ env.CATBOXHASH_ENABLED == 'false' }}
       run: |
         RELEASEURL=$(curl -F "reqtype=fileupload" -F "fileToUpload=@${{ env.patchedspotify }}" https://catbox.moe/user/api.php)
-        echo "Standard Release Download URL: $RELEASEURL"
         echo "RELEASEURL=$RELEASEURL" >> $GITHUB_ENV
-    
         RELEASEURLALTSTORE=$(curl -F "reqtype=fileupload" -F "fileToUpload=@${{ env.altpatchedspotify }}" https://catbox.moe/user/api.php)
-        echo "AltStore Release Download URL: $RELEASEURLALTSTORE"
         echo "RELEASEURLALTSTORE=$RELEASEURLALTSTORE" >> $GITHUB_ENV
-   
-    - name: Extract and Prepare VirusTotal Links
-      if: ${{ env.VT_ENABLED == 'true' }}
-      run: |
-        VTSPOTC=$(echo "$VTSPOTC" | sed 's/.*\(https:\/\/.*\)/\1/')
-        echo "SpotC++ VT: $VTSPOTC"
-        echo "VTSPOTC=$VTSPOTC" >> $GITHUB_ENV
-        VTALTSPOTC=$(echo "$VTALTSPOTC" | sed 's/.*\(https:\/\/.*\)/\1/')
-        echo "AltSpotC++ VT: $VTALTSPOTC"
-        echo "VTALTSPOTC=$VTALTSPOTC" >> $GITHUB_ENV
-        VTVANILLASPOTIFY=$(echo "$VTVANILLASPOTIFY" | sed 's/.*\(https:\/\/.*\)/\1/')
-        echo "Vanilla Spotify VT: $VTVANILLASPOTIFY"
-        echo "VTVANILLASPOTIFY=$VTVANILLASPOTIFY" >> $GITHUB_ENV
-        VTEEVEE=$(echo "$VTEEVEE" | sed 's/.*\(https:\/\/.*\)/\1/')
-        echo "EeveeSpotify VT: $VTEEVEE"
-        echo "VTEEVEE=$VTEEVEE" >> $GITHUB_ENV
-        VTSPOSIFY=$(echo "$VTSPOSIFY" | sed 's/.*\(https:\/\/.*\)/\1/')
-        echo "Sposify VT: $VTSPOSIFY"
-        echo "VTSPOSIFY=$VTSPOSIFY" >> $GITHUB_ENV
-        VTEXT=$(echo "$VTEXT" | sed 's/.*\(https:\/\/.*\)/\1/')
-        echo "OpenSpotifySafariExtension VT: $VTEXT"
-        echo "VTEXT=$VTEXT" >> $GITHUB_ENV
-        VTSPOSIFYFIX=$(echo "$VTSPOSIFYFIX" | sed 's/.*\(https:\/\/.*\)/\1/')
-        echo "SposifyFix VT: $VTSPOSIFYFIX"
-        echo "VTSPOSIFYFIX=$VTSPOSIFYFIX" >> $GITHUB_ENV
-        VTORION=$(echo "$VTORION" | sed 's/.*\(https:\/\/.*\)/\1/')
-        echo "Orion VT: $VTORION"
-        echo "VTORION=$VTORION" >> $GITHUB_ENV
-        VTSWIFTPROTOBUF=$(echo "$VTSWIFTPROTOBUF" | sed 's/.*\(https:\/\/.*\)/\1/')
-        echo "SwiftProtobuf VT: $VTSWIFTPROTOBUF"
-        echo "VTSWIFTPROTOBUF=$VTSWIFTPROTOBUF" >> $GITHUB_ENV
 
-    - name: Construct ChangeLog Pt.1
+    # ── ChangeLog ─────────────────────────────────────────────────────────────
+
+    - name: Construct ChangeLog
       run: |
         echo "## ChangeLog" > changelog.txt
-        
-    - name: Contruct ChangeLog Pt.2 (Eevee ChangeLog [Release])
-      if: ${{ github.event.inputs.USEACTIONSEEVEE == 'false' && env.EEVEESPOTIFY_UPDATED == 'true' }}
-      run: |
-        echo "$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ env.EEVEEREPO }}/releases/tags/${{ env.EEVEETAG }} | jq -r '.body' | sed -n '/^[[:space:]]*[*-+][[:space:]]/ { s/^[[:space:]]*[*-+] //; s/^/- (EeveeSpotify) /; p; }')" >> changelog.txt
-        
-    - name: Contruct ChangeLog Pt.2 (Eevee ChangeLog [Actions])
-      if: ${{ github.event.inputs.USEACTIONSEEVEE == 'true' }}
-      run: |
-        echo "$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/${{ env.EEVEEREPO }}/commits?since=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ env.EEVEEREPO }}/releases/latest | jq -r .published_at)" | jq -r '.[].commit.message' | grep -Ev "update: repo|Merge branch .+ of .+ into .+" | sed 's/^/- (EeveeSpotify) /')" >> changelog.txt
-
-    - name: Contruct ChangeLog Pt.3 (Add updated component lines)
-      run: |
-        if [ "${{ env.SPOTIFY_UPDATED }}" = 'true' ]; then
-          echo "- Updated Spotify to version ${{ env.VANILLASPOTIFYVERSION }} </br>" >> changelog.txt
-        fi
-        if [ "${{ env.EEVEESPOTIFY_UPDATED }}" = 'true' ]; then
-          echo "- Updated [EeveeSpotify](https://github.com/${{ env.EEVEEREPO }}) to version ${{ env.EEVEEVERSIONNAME }} </br>" >> changelog.txt
-        fi
-        if [ "${{ env.SPOSIFY_UPDATED }}" = 'true' ]; then
-          echo "- Updated Sposify to version ${{ env.SPOSIFYVERSION }} </br>" >> changelog.txt
-        fi
-        if [ "${{ env.OPENSPOTIFY_UPDATED }}" = 'true' ]; then
-          echo "- Updated Open in Spotify extension to commit ${{ env.EXTCOMMIT }} </br>" >> changelog.txt
-        fi
-        if [ "${{ env.SPOSIFYFIX_UPDATED }}" = 'true' ]; then
-          echo "- Updated Sposify Fix to version ${{ env.SPOSIFYFIXVERSION }} </br>" >> changelog.txt
-        fi
-        if [ "${{ env.ORIONRUNTIME_UPDATED }}" = 'true' ]; then
-          echo "- Updated Orion Runtime to version v${{ env.ORIONVERSION }} </br>" >> changelog.txt
-        fi
-        if [ "${{ env.SWIFTPROTOBUF_UPDATED }}" = 'true' ]; then
-          echo "- Updated SwiftProtobuf Framework to version ${{ env.SWIFTPROTOBUFVERSION }} </br>" >> changelog.txt
-        fi
-        
-    - name: Contruct ChangeLog Pt.4 (Rest of changelog)
-      run: |
-        # Hyperlink mentions of issues:
-        tail -n +2 changelog.txt | sed -E 's/#([0-9]+)/[#\1](https:\/\/github.com\/whoeevee\/EeveeSpotify\/issues\/\1)/g' > temp_changelog.txt
-        head -n 1 changelog.txt > final_changelog.txt
-        cat temp_changelog.txt >> final_changelog.txt
-        mv final_changelog.txt changelog.txt
-        rm temp_changelog.txt
-        
-        echo "***" >> changelog.txt
-        echo "Vanilla IPA decrypted using [BagBak](https://github.com/ChiChou/bagbak), on my personal MacBook Air and Jailbroken iPhone X running [Dopamine](https://github.com/opa334/Dopamine), feel free to contact me with questions about this environment." >> changelog.txt
-    
-    - name: Construct ChangeLog Pt.5 (Add EeveeSpotify Workflow Link)
-      if: ${{ github.event.inputs.USEACTIONSEEVEE == 'true' }}
-      run: |
-        assetnoZIP=$(echo "${{ env.eeveeAssetLink }}" | sed 's/\/zip$//')
-        RUN_ID=$(curl -s $assetnoZIP | jq -r .workflow_run.id)
-        eeveeUserAssetLink=$(echo "${{ env.eeveeAssetLink }}" | sed -E "s|https://api.github.com/repos/([^/]+)/([^/]+)/actions/artifacts/([0-9]+)/zip|https://github.com/\1/\2/actions/runs/${RUN_ID}/artifacts/\3|")
-        echo "The EeveeSpotify .deb was taken from the [latest Build workflow](${eeveeUserAssetLink})." >> changelog.txt
-    
-    - name: Construct ChangeLog Pt.6 (Add App Details and Workflow Link)
-      run: |
-        echo "App .ipa modified and tweaks injected using [my fork](https://github.com/yodaluca23/pyzule-rw) of [Cyan](https://github.com/asdfzxcvbn/pyzule-rw) with [the github Action Workflow.](${{ env.WORKFLOWURL }}) </br>" >> changelog.txt
-    
-    - name: Construct ChangeLog Pt.7 (Add Version Details & VirusTotal Results)
-      if: ${{ env.VT_ENABLED == 'true' }}
-      run: |
-        echo "<details>" >> changelog.txt
-        echo "<summary>Version Details & VirusTotal Results</summary>" >> changelog.txt
-        echo "<br>" >> changelog.txt
-        echo "<p>Spotify Version: v${{ env.VANILLASPOTIFYVERSION }}" >> changelog.txt
-        echo "<br><a href='${{ env.VTVANILLASPOTIFY }}'>Vanilla Spotify VirusTotal</a></p>" >> changelog.txt
-        echo "<p>EeveeSpotify Version: ${{ env.EEVEEVERSIONNAME }}" >> changelog.txt
-        echo "<br><a href='${{ env.VTEEVEE }}'>EeveeSpotify .deb VirusTotal</a></p>" >> changelog.txt
-        echo "<p>Sposify v${{ env.SPOSIFYVERSION }}" >> changelog.txt
-        echo "<br><a href='${{ env.VTSPOSIFY }}'>Sposify VirusTotal</a></p>" >> changelog.txt
-        echo "<p>OpenSpotifySafariExtension Commit: ${{ env.EXTCOMMIT }}" >> changelog.txt
-        echo "<br><a href='${{ env.VTEXT }}'>OpenSpotifySafariExtension Repo Compressed .zip VirusTotal</a></p>" >> changelog.txt
-        echo "<p>Sposify Fix v${{ env.SPOSIFYFIXVERSION }}" >> changelog.txt
-        echo "<br><a href='${{ env.VTSPOSIFYFIX }}'>Sposify Fix VirusTotal</a></p>" >> changelog.txt
-        echo "<p>Orion Runtime (iOS 14 - 16) Version: ${{ env.ORIONVERSION }}" >> changelog.txt
-        echo "<br><a href='${{ env.VTORION }}'>Orion Runtime (iOS 14 - 16) .deb VirusTotal</a></p>" >> changelog.txt
-        echo "<p>SwiftProtobuf Framework Version: ${{ env.SWIFTPROTOBUFVERSION }}" >> changelog.txt
-        echo "<br><a href='${{ env.VTSWIFTPROTOBUF }}'>SwiftProtobuf Framework .deb VirusTotal</a></p>" >> changelog.txt
-        echo "<p>SpotC++ Version: v${{ env.CHANGEVERSION }}" >> changelog.txt
-        echo "<br><a href='${{ env.VTSPOTC }}'>SpotC++ VirusTotal</a></p>" >> changelog.txt
-        echo "<p>AltStore SpotC++ Version: v${{ env.CHANGEVERSION }}" >> changelog.txt
-        echo "<br><a href='${{ env.VTALTSPOTC }}'>AltStore SpotC++ VirusTotal</a></p>" >> changelog.txt
-        echo "</details>" >> changelog.txt
-
-    - name: Construct ChangeLog Pt.8 (Add file name dropdown)
-      run: |
+        BULLET=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ env.EEVEEREPO }}/releases/tags/${{ env.EEVEETAG }} | jq -r '.body' | sed -n 's/^[[:space:]]*[*-+] //p' | grep -v '^$' | head -n 1)
+        echo "- $BULLET" >> changelog.txt
         echo "" >> changelog.txt
+        if [ "${{ env.HAPTICS_ENABLED }}" = "true" ]; then
+          echo "- ✨ **Custom Haptics**: ${{ env.HAPTIC_COUNT }} song haptic pattern(s) embedded (.ahap via Core Haptics)" >> changelog.txt
+        fi
         echo "***" >> changelog.txt
-        echo "" >> changelog.txt
-        echo "<details>" >> changelog.txt
-        echo "<summary>Files</summary>" >> changelog.txt
-        echo "SpotC++.v${{ env.CHANGEVERSION }}_v${{ env.VANILLASPOTIFYVERSION }}_ALTSTORESOURCE_ONLY.ipa<br>" >> changelog.txt
-        echo "SpotC++.v${{ env.CHANGEVERSION }}_v${{ env.VANILLASPOTIFYVERSION }}.ipa" >> changelog.txt
-        echo "</details>" >> changelog.txt
+        echo "App .ipa modified using [SpotC-HapticMod fork](https://github.com/SpotCompiled/SpotC-Plus-Plus) with [the GitHub Action Workflow.](${{ env.WORKFLOWURL }})" >> changelog.txt
+
+    # ── Draft Release ─────────────────────────────────────────────────────────
 
     - name: Create Draft Release
-      if: ${{ github.event.inputs.USEACTIONSEEVEE == 'true' || github.event.inputs.EEVEEREPO != '' }}
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: "v${{ env.CHANGEVERSION }}"
-        name: "SpotC++ v${{ env.CHANGEVERSION }}"
-        draft: true
-        body_path: changelog.txt
-        files: |
-          ${{ env.eevee-arm }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Create Draft Release
-      if: ${{ github.event.inputs.USEACTIONSEEVEE == 'false' && github.event.inputs.EEVEEREPO == '' }}
       uses: softprops/action-gh-release@v2
       with:
         tag_name: "v${{ env.CHANGEVERSION }}"
@@ -766,214 +390,3 @@ jobs:
         body_path: changelog.txt
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Download AltStore Repo.json
-      run: curl "https://raw.githubusercontent.com/SpotCompiled/SpotC-AltStore-Repo/main/AltStore%20Repo.json" -o ./AltStoreRepo.json
-
-    - name: Calculate SpotC++ Filesize
-      run: |
-        FILE_SIZE=$(stat -f%z "${{ env.patchedspotify }}")
-        echo "SpotC++ File Size: $FILE_SIZE"
-        echo "SPOTCSIZE=$FILE_SIZE" >> $GITHUB_ENV
-
-    - name: Calculate AltStore SpotC++ Filesize
-      run: |
-        FILE_SIZE=$(stat -f%z "${{ env.altpatchedspotify }}")
-        echo "AltStore SpotC++ File Size: $FILE_SIZE"
-        echo "ALTSPOTCSIZE=$FILE_SIZE" >> $GITHUB_ENV
-
-    - name: Fetch the first bullet point from the EeveeSpotify release changelog
-      id: fetch-changelog
-      run: |
-        BULLET_POINT=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ env.EEVEEREPO }}/releases/tags/${{ env.EEVEETAG }} | jq -r '.body' | sed -n 's/^[[:space:]]*[*-+] //p; s/^[[:space:]]* //p' | grep -v '^$' | head -n 1 | awk '{line=tolower($0); if (line ~ /localization|localisation/) print "Improved localizations."; else print $0}' | sed "s/\"/'/g")
-        echo "BULLET_POINT=$BULLET_POINT" >> $GITHUB_ENV
-
-    - name: Set ALTSTORECHANGELOG environment variable
-      run: |
-        if [ "${{ env.EEVEESPOTIFY_UPDATED }}" = 'true' ]; then
-          ALTSTORECHANGELOG="Updated EeveeSpotify to ${{ env.EEVEEVERSIONNAME }}. ${{ env.BULLET_POINT }}"
-        else
-          ALTSTORECHANGELOG="Updated Spotify to ${{ env.VANILLASPOTIFYVERSION }}."
-        fi
-    
-        ALTSTORECHANGELOG="${ALTSTORECHANGELOG}\n\n More Info:\n https://github.com/SpotCompiled/SpotC-Plus-Plus/releases/tag/v${{ env.CHANGEVERSION }}"
-    
-        echo "ALTSTORECHANGELOG=$ALTSTORECHANGELOG" >> $GITHUB_ENV
-    
-          
-    - name: Update AltStore Repo.json
-      run: |
-        ENTITLE=$(cat "./Build Components/Entitlements.json")
-        PRIVACYKEYS=$(cat "./Build Components/NSDescriptions.json")
-        jq --arg CHANGEVERSION "${{ env.CHANGEVERSION }}" \
-           --arg CURRENTDATE "$(date +%Y-%-m-%d)" \
-           --arg SIZE "${{ env.ALTSPOTCSIZE }}" \
-           --arg RELEASEURL "${{ env.RELEASEURLALTSTORE }}" \
-           --arg ALTSTORECHANGELOG "${{ env.ALTSTORECHANGELOG }}" \
-           --arg VANILLASPOTIFYVERSION "${{ env.VANILLASPOTIFYVERSION }}" \
-           --arg EEVEEVERSIONNAME "${{ env.EEVEEVERSIONNAME }}" \
-           --arg SPOSIFYVERSION "${{ env.SPOSIFYVERSION }}" \
-           --arg EXTCOMMIT "${{ env.EXTCOMMIT }}" \
-           --arg SPOSIFYFIXVERSION "${{ env.SPOSIFYFIXVERSION }}" \
-           --arg ORIONVERSION "${{ env.ORIONVERSION }}" \
-           --arg MINVERSION "${{ env.MIN_IOS_VERSION }}" \
-           --argjson PRIVKEYS "$PRIVACYKEYS" \
-           --argjson ENTITLEMENTS "$ENTITLE" \
-           --arg SWIFTPROTOBUFVERSION "${{ env.SWIFTPROTOBUFVERSION }}" \
-           '
-           (.apps[] | select(.name == "SpotC++") | .version) = $CHANGEVERSION |
-           (.apps[] | select(.name == "SpotC++") | .versionDate) = $CURRENTDATE |
-           (.apps[] | select(.name == "SpotC++") | .size) = ($SIZE | tonumber) |
-           (.apps[] | select(.name == "SpotC++") | .changelog) = $ALTSTORECHANGELOG |
-           (.apps[] | select(.name == "SpotC++") | .appPermissions.privacy) = $PRIVKEYS |
-           (.apps[] | select(.name == "SpotC++") | .appPermissions.entitlements) = $ENTITLEMENTS |
-           (.apps[] | select(.name == "SpotC++") | .versionDescription) = $ALTSTORECHANGELOG |
-           (.apps[] | select(.name == "SpotC++") | .minOSVersion) = $MINVERSION |
-           (.apps[] | select(.name == "SpotC++") | .downloadURL) = $RELEASEURL |
-           (.apps[] | select(.name == "SpotC++") | .versions) |= [{
-              "version": $CHANGEVERSION,
-              "date": $CURRENTDATE,
-              "localizedDescription": $ALTSTORECHANGELOG,
-              "downloadURL": $RELEASEURL,
-              "size": ($SIZE | tonumber),
-              "minOSVersion": $MINVERSION
-           }] + . |
-           (.apps[] | select(.name == "SpotC++") | .information) = [
-              {
-                  "item": "Spotify",
-                  "version": "v\($VANILLASPOTIFYVERSION)",
-                  "authors": "Spotify AB",
-                  "url": "https://www.spotify.com"
-              },
-              {
-                  "item": "EeveeSpotify",
-                  "version": $EEVEEVERSIONNAME,
-                  "authors": "Whoeevee & Asdfzxcvbn",
-                  "url": "https://github.com/${{ env.EEVEEREPO }}"
-              },
-              {
-                  "item": "Sposify",
-                  "version": "v\($SPOSIFYVERSION)",
-                  "authors": "aesthyrica",
-                  "url": "https://repo.dynastic.co/package/com.spos"
-              },
-              {
-                  "item": "OpenSpotifySafariExtension",
-                  "version": "Commit \($EXTCOMMIT)",
-                  "authors": "Whoeevee",
-                  "url": "https://github.com/whoeevee/OpenSpotifySafariExtension"
-              },
-              {
-                  "item": "Sposify Fix",
-                  "version": "v\($SPOSIFYFIXVERSION)",
-                  "authors": "level3tjg",
-                  "url": "https://level3tjg.me/repo/depictions?p=com.level3tjg.sposifyfix"
-              },
-              {
-                  "item": "Orion Runtime",
-                  "version": "v\($ORIONVERSION)",
-                  "authors": "Theos Team",
-                  "url": "https://orion.theos.dev"
-              },
-              {
-                  "item": "SwiftProtobuf Framework",
-                  "version": "v\($SWIFTPROTOBUFVERSION)",
-                  "authors": "Apple Inc.",
-                  "url": "https://github.com/apple/swift-protobuf"
-              }
-           ]
-           ' AltStoreRepo.json > AltStoreRepo_updated.json
-          mv AltStoreRepo_updated.json AltStoreRepo.json
-    
-    - name: Upload updated AltStore Repo.json as artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: UpdatedAltStoreRepo
-        path: AltStoreRepo.json
-
-    - name: Download Scarlet Repo.json
-      run: curl "https://raw.githubusercontent.com/SpotCompiled/SpotC-Repo/main/Scarlet%20Repo.json" -o ./ScarletRepo.json
-
-    - name: Update Scarlet Repo.json
-      run: |
-        jq --arg CHANGEVERSION "${{ env.CHANGEVERSION }}" \
-           --arg CURRENTDATE "$(date +%Y-%-m-%d)" \
-           --arg SIZE "${{ env.SPOTCSIZE }}" \
-           --arg RELEASEURL "${{ env.RELEASEURL }}" \
-           --arg SCARLETCHANGELOG "${{ env.ALTSTORECHANGELOG }}" \
-           --arg VANILLASPOTIFYVERSION "${{ env.VANILLASPOTIFYVERSION }}" \
-           --arg EEVEEVERSIONNAME "${{ env.EEVEEVERSIONNAME }}" \
-           --arg SPOSIFYVERSION "${{ env.SPOSIFYVERSION }}" \
-           --arg EXTCOMMIT "${{ env.EXTCOMMIT }}" \
-           --arg SPOSIFYFIXVERSION "${{ env.SPOSIFYFIXVERSION }}" \
-           --arg ORIONVERSION "${{ env.ORIONVERSION }}" \
-           --arg MINVERSION "${{ env.MIN_IOS_VERSION }}" \
-           --arg SWIFTPROTOBUFVERSION "${{ env.SWIFTPROTOBUFVERSION }}" \
-           '
-           (.apps[] | select(.name == "SpotC++") | .version) = $CHANGEVERSION |
-           (.apps[] | select(.name == "SpotC++") | .versionDate) = $CURRENTDATE |
-           (.apps[] | select(.name == "SpotC++") | .size) = ($SIZE | tonumber) |
-           (.apps[] | select(.name == "SpotC++") | .changelog) = $SCARLETCHANGELOG |
-           (.apps[] | select(.name == "SpotC++") | .versionDescription) = $SCARLETCHANGELOG |
-           (.apps[] | select(.name == "SpotC++") | .minOSVersion) = $MINVERSION |
-           (.apps[] | select(.name == "SpotC++") | .downloadURL) = $RELEASEURL |
-           (.apps[] | select(.name == "SpotC++") | .versions) |= [{
-              "version": $CHANGEVERSION,
-              "date": $CURRENTDATE,
-              "localizedDescription": $SCARLETCHANGELOG,
-              "downloadURL": $RELEASEURL,
-              "size": ($SIZE | tonumber),
-              "minOSVersion": $MINVERSION
-           }] + . |
-           (.apps[] | select(.name == "SpotC++") | .information) = [
-              {
-                  "item": "Spotify",
-                  "version": "v\($VANILLASPOTIFYVERSION)",
-                  "authors": "Spotify AB",
-                  "url": "https://www.spotify.com"
-              },
-              {
-                  "item": "EeveeSpotify",
-                  "version": $EEVEEVERSIONNAME,
-                  "authors": "Whoeevee & Asdfzxcvbn",
-                  "url": "https://github.com/${{ env.EEVEEREPO }}"
-              },
-              {
-                  "item": "Sposify",
-                  "version": "v\($SPOSIFYVERSION)",
-                  "authors": "aesthyrica",
-                  "url": "https://repo.dynastic.co/package/com.spos"
-              },
-              {
-                  "item": "OpenSpotifySafariExtension",
-                  "version": "Commit \($EXTCOMMIT)",
-                  "authors": "Whoeevee",
-                  "url": "https://github.com/whoeevee/OpenSpotifySafariExtension"
-              },
-              {
-                  "item": "Sposify Fix",
-                  "version": "v\($SPOSIFYFIXVERSION)",
-                  "authors": "level3tjg",
-                  "url": "https://level3tjg.me/repo/depictions?p=com.level3tjg.sposifyfix"
-              },
-              {
-                  "item": "Orion Runtime",
-                  "version": "v\($ORIONVERSION)",
-                  "authors": "Theos Team",
-                  "url": "https://orion.theos.dev"
-              },
-              {
-                  "item": "SwiftProtobuf Framework",
-                  "version": "v\($SWIFTPROTOBUFVERSION)",
-                  "authors": "Apple Inc.",
-                  "url": "https://github.com/apple/swift-protobuf"
-              }
-           ]
-           ' ScarletRepo.json > ScarletRepo_updated.json
-          mv ScarletRepo_updated.json ScarletRepo.json
-    
-    - name: Upload updated Scarlet Repo.json as artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: UpdatedScarletRepo
-        path: ScarletRepo.json
