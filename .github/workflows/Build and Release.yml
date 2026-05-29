@@ -245,9 +245,9 @@ jobs:
         # Manually clone Theos directly into /opt/theos
         sudo git clone --recursive https://github.com/theos/theos.git /opt/theos
         
-        # Pull down a genuine pre-patched iOS 16.5 SDK archive from the release mirror
+        # Pull down the genuine release SDK archive straight from the theos/sdks releases mirror
         sudo mkdir -p /opt/theos/sdks
-        curl -LO https://github.com/AlexandreColucci/theos-sdks/releases/download/1.3.0/iPhoneOS16.5.sdk.tar.xz
+        curl -LO https://github.com/theos/sdks/releases/download/patched/iPhoneOS16.5.sdk.tar.xz
         sudo tar -xf iPhoneOS16.5.sdk.tar.xz -C /opt/theos/sdks/
         rm iPhoneOS16.5.sdk.tar.xz
         
