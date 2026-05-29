@@ -242,8 +242,18 @@ jobs:
     - name: Install Theos
       if: steps.cache-theos.outputs.cache-hit != 'true'
       run: |
-        bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
-        echo "Theos installed ✅"
+        # Manually clone Theos directly into /opt/theos
+        sudo git clone --recursive https://github.com/theos/theos.git /opt/theos
+        
+        # Pull down a pre-patched iOS 16.5 SDK from an open mirror to bypass the API limit
+        sudo mkdir -p /opt/theos/sdks
+        curl -LO https://github.com/theos/sdks/raw/master/iPhoneOS16.5.sdk.tar.xz
+        sudo tar -xf iPhoneOS16.5.sdk.tar.xz -C /opt/theos/sdks/
+        rm iPhoneOS16.5.sdk.tar.xz
+        
+        # Set proper folder permissions for the runner
+        sudo chown -R $USER /opt/theos
+        echo "Theos and iOS SDK manually installed successfully! ✅"
 
     - name: Build SpotHaptics tweak
       run: |
