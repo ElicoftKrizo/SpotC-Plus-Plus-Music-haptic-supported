@@ -307,88 +307,139 @@ jobs:
     - name: Download and convert custom audio → .ahap
       if: ${{ github.event.inputs.HAPTICS_AUDIO_ZIP_URL != '' }}
       run: |
-        echo "📥 Downloading audio ZIP …"
-        mkdir -p custom_audio haptics_output
+        mkdir -p haptics_output
+        INPUT_URL="${{ github.event.inputs.HAPTICS_AUDIO_ZIP_URL }}"
 
-        AUDIO_URL="${{ github.event.inputs.HAPTICS_AUDIO_ZIP_URL }}"
+        # ── Detect input type from URL extension ──────────────────────────────
+        # Strip query strings for extension matching, then lowercase.
+        URL_PATH=$(echo "$INPUT_URL" | sed 's/?.*//' | tr '[:upper:]' '[:lower:]')
 
-        # ── Host-specific direct-link rewriting ──────────────────────────────
-        # Many file-sharing hosts redirect through an HTML confirmation page
-        # instead of serving raw bytes, even with -L.  Rewrite known patterns
-        # to their direct-download equivalents before curling.
+        if echo "$URL_PATH" | grep -qE '\.ahap$'; then
+          # ════════════════════════════════════════════════════════════════════
+          # BYPASS PATH: URL points directly to a pre-made .ahap file.
+          # Skip download → unzip → Python conversion entirely.
+          # Just download the .ahap and drop it straight into haptics_output/.
+          # ════════════════════════════════════════════════════════════════════
+          echo "🎯 Direct .ahap URL detected — bypassing audio conversion."
 
-        # Google Drive: /file/d/<ID>/view  →  export?id=<ID>&confirm=t
-        if echo "$AUDIO_URL" | grep -q "drive.google.com/file/d/"; then
-          FILE_ID=$(echo "$AUDIO_URL" | sed -E 's|.*/file/d/([^/]+).*|\1|')
-          AUDIO_URL="https://drive.google.com/uc?export=download&id=${FILE_ID}&confirm=t"
-          echo "🔗 Rewritten as Google Drive direct-download URL (id=${FILE_ID})"
+          AHAP_NAME=$(basename "$URL_PATH")
+          # Fallback name if basename produces nothing sensible
+          [ -z "$AHAP_NAME" ] || [ "$AHAP_NAME" = ".ahap" ] && AHAP_NAME="custom.ahap"
+
+          echo "📥 Downloading $AHAP_NAME …"
+          curl -L \
+            --retry 3 --retry-delay 5 \
+            -A "Mozilla/5.0 (compatible; GitHub-Actions-Bot)" \
+            -o "haptics_output/${AHAP_NAME}" \
+            "$INPUT_URL"
+
+          # Validate: .ahap files are JSON — first byte must be '{' (0x7b)
+          MAGIC=$(xxd -l 1 "haptics_output/${AHAP_NAME}" 2>/dev/null | awk '{print $2}')
+          if [ "$MAGIC" != "7b" ]; then
+            echo "❌ ERROR: Downloaded file does not look like a valid .ahap (expected JSON)."
+            echo "   First byte: $MAGIC — check that the URL serves a raw .ahap file."
+            exit 1
+          fi
+
+          echo "✅ .ahap downloaded and validated: haptics_output/${AHAP_NAME}"
+
+        else
+          # ════════════════════════════════════════════════════════════════════
+          # NORMAL PATH: URL points to a ZIP of audio files (MP3/WAV/etc).
+          # Download → validate magic bytes → unzip → convert to .ahap.
+          # ════════════════════════════════════════════════════════════════════
+          echo "📥 Downloading audio ZIP …"
+          mkdir -p custom_audio
+
+          # ── Host-specific direct-link rewriting ────────────────────────────
+          AUDIO_URL="$INPUT_URL"
+
+          # Google Drive: /file/d/<ID>/view  →  export?id=<ID>&confirm=t
+          if echo "$AUDIO_URL" | grep -q "drive.google.com/file/d/"; then
+            FILE_ID=$(echo "$AUDIO_URL" | sed -E 's|.*/file/d/([^/]+).*|\1|')
+            AUDIO_URL="https://drive.google.com/uc?export=download&id=${FILE_ID}&confirm=t"
+            echo "🔗 Rewritten as Google Drive direct-download URL (id=${FILE_ID})"
+          fi
+
+          # Dropbox: ?dl=0  →  ?dl=1
+          if echo "$AUDIO_URL" | grep -q "dropbox.com"; then
+            AUDIO_URL=$(echo "$AUDIO_URL" | sed 's/?dl=0/?dl=1/g')
+            echo "🔗 Rewritten as Dropbox direct-download URL"
+          fi
+
+          curl -L \
+            --fail-with-body \
+            --retry 3 --retry-delay 5 \
+            -H "Accept: application/zip, application/octet-stream, */*" \
+            -A "Mozilla/5.0 (compatible; GitHub-Actions-Bot)" \
+            -w "HTTP response code: %{http_code}\n" \
+            -o custom_audio.zip \
+            "$AUDIO_URL"
+
+          # ── Validate magic bytes (ZIP = PK\x03\x04 = 504b0304) ─────────────
+          MAGIC=$(xxd -l 4 custom_audio.zip 2>/dev/null | awk '{print $2$3}' | tr -d ' ' | head -c8)
+          echo "File magic bytes: $MAGIC"
+
+          if [ "$MAGIC" != "504b0304" ]; then
+            echo ""
+            echo "❌ ERROR: The downloaded file is NOT a valid ZIP archive."
+            echo "   Magic bytes expected: 504b0304  —  got: $MAGIC"
+            echo "   First 512 bytes (likely an HTML page):"
+            head -c 512 custom_audio.zip | cat -v
+            echo ""
+            echo "   SOLUTIONS:"
+            echo "   1. Use a direct-download URL (not a preview/share link)."
+            echo "   2. GitHub Releases and Catbox.moe work reliably."
+            echo "   3. Or pass a direct .ahap URL to skip conversion entirely."
+            exit 1
+          fi
+
+          echo "✅ Download verified as a valid ZIP ($(du -sh custom_audio.zip | cut -f1))."
+          unzip -q custom_audio.zip -d custom_audio
+          rm custom_audio.zip
+
+          echo "📦 ZIP contents:"
+          find custom_audio -type f | head -40
+
+          # ── Smart content detection ──────────────────────────────────────
+          # Count .ahap files vs audio files inside the extracted ZIP.
+          AHAP_COUNT=$(find custom_audio -type f -iname "*.ahap" | wc -l | tr -d ' ')
+          AUDIO_COUNT=$(find custom_audio -type f \
+            \( -iname "*.mp3" -o -iname "*.wav" -o -iname "*.flac" \
+               -o -iname "*.aac" -o -iname "*.m4a" -o -iname "*.ogg" \) \
+            | wc -l | tr -d ' ')
+
+          echo "Detected: ${AHAP_COUNT} .ahap file(s), ${AUDIO_COUNT} audio file(s)."
+
+          if [ "$AHAP_COUNT" -gt 0 ] && [ "$AUDIO_COUNT" -eq 0 ]; then
+            # ZIP contained pre-made .ahap files — move directly, skip conversion.
+            echo "🎯 ZIP contains only .ahap files — bypassing audio conversion."
+            find custom_audio -type f -iname "*.ahap" -exec mv {} haptics_output/ \;
+            echo "✅ Moved ${AHAP_COUNT} .ahap file(s) to haptics_output/."
+
+          elif [ "$AUDIO_COUNT" -gt 0 ]; then
+            # ZIP contained audio files — run the converter.
+            echo ""
+            echo "🎛️  Converting ${AUDIO_COUNT} audio file(s) to .ahap …"
+            python3 haptic_converter/batch_convert.py \
+              custom_audio \
+              haptics_output \
+              --workers 2 \
+              --min-transient-intensity ${{ github.event.inputs.HAPTICS_MIN_TRANSIENT }} \
+              --min-continuous-intensity ${{ github.event.inputs.HAPTICS_MIN_CONTINUOUS }}
+
+          else
+            echo "❌ ERROR: ZIP contained no recognised .ahap or audio files."
+            echo "   Supported audio: mp3 wav flac aac m4a ogg"
+            echo "   Or zip a folder of pre-made .ahap files directly."
+            exit 1
+          fi
         fi
-
-        # Dropbox: ?dl=0  →  ?dl=1
-        if echo "$AUDIO_URL" | grep -q "dropbox.com"; then
-          AUDIO_URL=$(echo "$AUDIO_URL" | sed 's/?dl=0/?dl=1/g')
-          echo "🔗 Rewritten as Dropbox direct-download URL"
-        fi
-
-        # GitHub release asset: ensure we're not hitting an HTML page
-        # (GitHub release URLs work fine with -L; no rewrite needed)
-
-        # ── Download with full diagnostic headers ────────────────────────────
-        HTTP_CODE=$(curl -L \
-          --fail-with-body \
-          --retry 3 --retry-delay 5 \
-          -H "Accept: application/zip, application/octet-stream, */*" \
-          -A "Mozilla/5.0 (compatible; GitHub-Actions-Bot)" \
-          -w "%{http_code}" \
-          -o custom_audio.zip \
-          "$AUDIO_URL" 2>&1) || true
-
-        echo "HTTP response code: $HTTP_CODE"
-
-        # ── Validate the download is actually a ZIP ──────────────────────────
-        # ZIP files always begin with the magic bytes  PK\x03\x04  (hex 504B0304).
-        MAGIC=$(xxd -l 4 custom_audio.zip 2>/dev/null | awk '{print $2$3}' | tr -d ' ' | head -c8)
-        echo "File magic bytes: $MAGIC"
-
-        if [ "$MAGIC" != "504b0304" ]; then
-          echo ""
-          echo "❌ ERROR: The downloaded file is NOT a valid ZIP archive."
-          echo "   Magic bytes expected: 504b0304  —  got: $MAGIC"
-          echo ""
-          echo "   First 512 bytes of what was downloaded (likely HTML or redirect page):"
-          echo "   ──────────────────────────────────────────────────────────────────────"
-          head -c 512 custom_audio.zip | cat -v
-          echo ""
-          echo "   SOLUTIONS:"
-          echo "   1. Use a direct-download URL (not a preview/share link)."
-          echo "   2. GitHub Releases, Catbox.moe, and raw file CDNs all work reliably."
-          echo "   3. For Google Drive, confirm the file is publicly shared and the"
-          echo "      URL format is /file/d/<ID>/view — the rewriter handles the rest."
-          echo "   4. For Dropbox, ensure the URL ends in ?dl=0 — the rewriter converts"
-          echo "      it to ?dl=1 automatically."
-          exit 1
-        fi
-
-        echo "✅ Download verified as a valid ZIP archive ($(du -sh custom_audio.zip | cut -f1))."
-        unzip -q custom_audio.zip -d custom_audio
-        rm custom_audio.zip
-
-        echo "🎵 Found audio files:"
-        find custom_audio -type f | head -40
-
-        echo ""
-        echo "🎛️  Converting to .ahap …"
-        python3 haptic_converter/batch_convert.py \
-          custom_audio \
-          haptics_output \
-          --workers 2 \
-          --min-transient-intensity ${{ github.event.inputs.HAPTICS_MIN_TRANSIENT }} \
-          --min-continuous-intensity ${{ github.event.inputs.HAPTICS_MIN_CONTINUOUS }}
 
         HAPTIC_COUNT=$(find haptics_output -name "*.ahap" | wc -l | tr -d ' ')
         echo "HAPTIC_COUNT=$HAPTIC_COUNT" >> $GITHUB_ENV
         echo "HAPTICS_ENABLED=true" >> $GITHUB_ENV
-        echo "✅  $HAPTIC_COUNT haptic pattern(s) generated."
+        echo "✅  $HAPTIC_COUNT haptic pattern(s) ready."
 
     - name: Set haptics disabled flag (no audio provided)
       if: ${{ github.event.inputs.HAPTICS_AUDIO_ZIP_URL == '' }}
