@@ -1,40 +1,30 @@
 // SpotHaptics/Sources/SpotHaptics/SpotHapticsHooks.x.swift
 // ─────────────────────────────────────────────────────────────────────────────
-// Orion hooks that bridge Spotify's internal playback engine to the
-// HapticEngineManager.
+// Bridges Spotify's internal playback engine to HapticEngineManager.
 //
-// Hook strategy (layered for robustness):
+// FIX (crash on launch — EXC_BREAKPOINT / fatalError in libswiftCore):
+//   Orion's ClassHook<NSObject> calls fatalError at *compile-time-generated*
+//   static init if the target ObjC class is absent at dylib load time.
+//   That happens *before* any Swift init() code runs, so NSClassFromString
+//   guards in init() cannot help.
 //
-//   LAYER 1 – SPTPlayerImpl  (primary, most reliable)
-//     The main playback coordinator. Hooks `playerImpl:stateDidChange:` which
-//     fires on every play/pause/seek/track-change event with a full state
-//     object containing the current track's Spotify URI.
+//   Solution: Remove ALL ClassHook usage for Spotify-internal classes.
+//   Replace with plain ObjC runtime swizzling (method_exchangeImplementations)
+//   performed lazily inside the Tweak init(), guarded by NSClassFromString.
+//   Only UIApplicationHook (which targets UIApplication — always present) keeps
+//   ClassHook, because that is safe.
 //
-//   LAYER 2 – SPTQueueServicePlayerImpl  (fallback for newer Spotify builds)
-//     Alternative player coordinator introduced in later SDK versions.
-//     Hooks the same state-change selector.
-//
-//   LAYER 3 – NSNotificationCenter observer  (belt-and-suspenders)
-//     Spotify posts `SPTNowPlayingItemDidChangeNotification` whenever the
-//     current track changes. Caught here as a last-resort fallback, extracting
-//     the track URI from the `userInfo` dictionary.
-//
-// FIX (crash on launch): Each Spotify-internal class hook now lives in its own
-// HookGroup. The Tweak init guards every group activation with NSClassFromString
-// so that Orion never calls fatalError on a missing class (which caused an
-// instant crash on Spotify 9.0.96 / iOS 26 where one or more of these classes
-// was renamed/removed).
-//
-// Build environment:
-//   - Orion (https://orion.theos.dev) – the Theos-native Swift hooking framework
-//   - Theos 2.x with Swift support
-//   - Deployment target: iOS 13+ (CHHapticEngine requires iOS 13)
-//
-// File location inside the repo:
-//   SpotHaptics/Sources/SpotHaptics/SpotHapticsHooks.x.swift
+// Hook strategy:
+//   SWIZZLE 1 – SPTPlayerImpl.playerImpl:stateDidChange:
+//   SWIZZLE 2 – SPTPlayerImpl.playerImpl:didChangeState:
+//   SWIZZLE 3 – SPTQueueServicePlayerImpl.playerImpl:stateDidChange:
+//   SWIZZLE 4 – SPTNowPlayingModel.setCurrentTrack:
+//   LAYER  5  – NSNotificationCenter (always-on belt-and-suspenders)
+//   HOOK   6  – UIApplicationHook (background / foreground lifecycle)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import Orion
+import ObjectiveC
 import Foundation
 import UIKit
 import os.log
@@ -45,130 +35,27 @@ private let hlog = OSLog(subsystem: "com.spotc.SpotHaptics", category: "Hooks")
 // MARK: - Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Extract the best identifier from an opaque Spotify player-state object.
-/// Tries, in order:
-///   1. `item.URI`            (e.g. "spotify:track:4iV5W9uYEdYUVa79Axb7Rh")
-///   2. `item.trackUri`       (some SDK versions)
-///   3. `item.name` / `item.trackName`  (human-readable title fallback)
 private func extractTrackID(fromState state: AnyObject) -> String? {
-    // --- URI via item.URI ---
-    if let item = (state as? NSObject)?.value(forKeyPath: "item.URI") as? String,
-       !item.isEmpty {
-        return item
-    }
-    // --- URI via item.trackUri ---
-    if let item = (state as? NSObject)?.value(forKeyPath: "item.trackUri") as? String,
-       !item.isEmpty {
-        return item
-    }
-    // --- Human-readable name ---
-    if let name = (state as? NSObject)?.value(forKeyPath: "item.name") as? String,
-       !name.isEmpty {
-        return name
-    }
-    if let name = (state as? NSObject)?.value(forKeyPath: "item.trackName") as? String,
-       !name.isEmpty {
-        return name
+    for keyPath in ["item.URI", "item.trackUri", "item.name", "item.trackName"] {
+        if let val = (state as? NSObject)?.value(forKeyPath: keyPath) as? String,
+           !val.isEmpty { return val }
     }
     return nil
 }
 
-/// True when the state object signals playback is active (not paused/stopped).
 private func isPlaying(state: AnyObject) -> Bool {
-    // `isPaused` flag (Bool or NSNumber)
     if let paused = (state as? NSObject)?.value(forKeyPath: "isPaused") {
-        if let b = paused as? Bool      { return !b }
-        if let n = paused as? NSNumber  { return !n.boolValue }
+        if let b = paused as? Bool     { return !b }
+        if let n = paused as? NSNumber { return !n.boolValue }
     }
-    // `playbackStatus` == 1 means playing in some SDK versions
     if let status = (state as? NSObject)?.value(forKeyPath: "playbackStatus") as? Int {
         return status == 1
     }
-    // Default: assume playing if we can't determine
     return true
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - HookGroup declarations
-//
-// Each Spotify-internal class gets its own group so we can activate them
-// independently. Activating a group whose target class doesn't exist causes
-// Orion to call fatalError — separate groups + NSClassFromString guards prevent
-// that crash entirely.
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct SpotHapticsGroup: HookGroup {}           // UIApplication — always exists
-struct SPTPlayerImplGroup: HookGroup {}         // SPTPlayerImpl — may not exist
-struct SPTQueueServiceGroup: HookGroup {}       // SPTQueueServicePlayerImpl — may not exist
-struct SPTNowPlayingGroup: HookGroup {}         // SPTNowPlayingModel — may not exist
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - LAYER 1: SPTPlayerImpl hook
-// ─────────────────────────────────────────────────────────────────────────────
-
-class SPTPlayerImplHook: ClassHook<NSObject> {
-    typealias Group = SPTPlayerImplGroup
-    static let targetName = "SPTPlayerImpl"
-
-    // Fires on every player state change.
-    func playerImpl(_ playerImpl: AnyObject, stateDidChange state: AnyObject) {
-        orig.playerImpl(playerImpl, stateDidChange: state)
-        handleStateChange(state)
-    }
-
-    // Some Spotify versions use a slightly different selector name.
-    func playerImpl(
-        _ playerImpl: AnyObject,
-        didChangeState state: AnyObject
-    ) {
-        orig.playerImpl(playerImpl, didChangeState: state)
-        handleStateChange(state)
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - LAYER 2: SPTQueueServicePlayerImpl hook (newer builds)
-// ─────────────────────────────────────────────────────────────────────────────
-
-class SPTQueueServicePlayerImplHook: ClassHook<NSObject> {
-    typealias Group = SPTQueueServiceGroup
-    static let targetName = "SPTQueueServicePlayerImpl"
-
-    func playerImpl(_ playerImpl: AnyObject, stateDidChange state: AnyObject) {
-        orig.playerImpl(playerImpl, stateDidChange: state)
-        handleStateChange(state)
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - LAYER 3: SPTNowPlayingModel / current-item change
-// ─────────────────────────────────────────────────────────────────────────────
-
-class SPTNowPlayingModelHook: ClassHook<NSObject> {
-    typealias Group = SPTNowPlayingGroup
-    static let targetName = "SPTNowPlayingModel"
-
-    func setCurrentTrack(_ track: AnyObject) {
-        orig.setCurrentTrack(track)
-
-        let uri  = (track as? NSObject)?.value(forKeyPath: "URI")       as? String
-            ?? (track as? NSObject)?.value(forKeyPath: "trackUri")    as? String
-            ?? (track as? NSObject)?.value(forKeyPath: "name")         as? String
-
-        guard let id = uri, !id.isEmpty else { return }
-
-        os_log("SPTNowPlayingModel track change: %{public}@", log: hlog, type: .debug, id)
-        HapticEngineManager.shared.playHaptics(forTrackID: id)
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Shared state-change handler (used by LAYER 1 & 2)
-// ─────────────────────────────────────────────────────────────────────────────
-
 private func handleStateChange(_ state: AnyObject) {
     guard let id = extractTrackID(fromState: state) else { return }
-
     if isPlaying(state: state) {
         os_log("Track playing: %{public}@", log: hlog, type: .debug, id)
         HapticEngineManager.shared.playHaptics(forTrackID: id)
@@ -179,85 +66,121 @@ private func handleStateChange(_ state: AnyObject) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - LAYER 4: NSNotificationCenter observer (belt-and-suspenders)
+// MARK: - ObjC runtime swizzle helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-private let kTrackDidChange   = "SPTNowPlayingItemDidChangeNotification"
-private let kPlaybackPlay     = "SPTPlaybackPlayNotification"
-private let kPlaybackPause    = "SPTPlaybackPauseNotification"
-private let kPlaybackStop     = "SPTPlaybackStopNotification"
-
-final class SpotHapticsNotificationObserver {
-    static let shared = SpotHapticsNotificationObserver()
-
-    private init() {
-        let nc = NotificationCenter.default
-
-        nc.addObserver(
-            self,
-            selector: #selector(onTrackChange(_:)),
-            name: NSNotification.Name(kTrackDidChange),
-            object: nil
-        )
-        nc.addObserver(
-            self,
-            selector: #selector(onPlay(_:)),
-            name: NSNotification.Name(kPlaybackPlay),
-            object: nil
-        )
-        nc.addObserver(
-            self,
-            selector: #selector(onPause(_:)),
-            name: NSNotification.Name(kPlaybackPause),
-            object: nil
-        )
-        nc.addObserver(
-            self,
-            selector: #selector(onStop(_:)),
-            name: NSNotification.Name(kPlaybackStop),
-            object: nil
-        )
-
-        os_log("Notification observers registered", log: hlog, type: .info)
+/// Swizzles `selector` on `targetClass` with the IMP from `replacementClass`.
+/// Returns true on success, silently returns false if anything is missing.
+@discardableResult
+private func swizzle(
+    targetClass: AnyClass,
+    selector: Selector,
+    replacementClass: AnyClass
+) -> Bool {
+    guard
+        let original = class_getInstanceMethod(targetClass, selector),
+        let replacement = class_getInstanceMethod(replacementClass, selector)
+    else {
+        os_log("swizzle: method %{public}@ not found on %{public}@",
+               log: hlog, type: .info,
+               NSStringFromSelector(selector), NSStringFromClass(targetClass))
+        return false
     }
+    method_exchangeImplementations(original, replacement)
+    os_log("swizzled %{public}@ on %{public}@",
+           log: hlog, type: .info,
+           NSStringFromSelector(selector), NSStringFromClass(targetClass))
+    return true
+}
 
-    @objc private func onTrackChange(_ note: Notification) {
-        let id = (note.userInfo?["SPTNowPlayingItemURI"]     as? String)
-            ?? (note.userInfo?["uri"]                       as? String)
-            ?? (note.userInfo?["trackUri"]                  as? String)
-            ?? (note.userInfo?["SPTNowPlayingTrackTitle"]   as? String)
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Swizzle replacement implementations
+//
+// These classes exist only to hold replacement IMPs.
+// They are NEVER instantiated or registered as hooks with Orion.
+// ─────────────────────────────────────────────────────────────────────────────
 
-        guard let trackID = id, !trackID.isEmpty else { return }
-
-        os_log("Notification track change: %{public}@", log: hlog, type: .debug, trackID)
-        HapticEngineManager.shared.playHaptics(forTrackID: trackID)
+@objc private class SPTPlayerImplSwizzle: NSObject {
+    @objc func playerImpl(_ playerImpl: AnyObject, stateDidChange state: AnyObject) {
+        // Call original (swizzled, so self's class now points to orig)
+        self.playerImpl(playerImpl, stateDidChange: state)
+        handleStateChange(state)
     }
-
-    @objc private func onPlay(_ note: Notification) {
-        HapticEngineManager.shared.resumeHaptics()
+    @objc func playerImpl(_ playerImpl: AnyObject, didChangeState state: AnyObject) {
+        self.playerImpl(playerImpl, didChangeState: state)
+        handleStateChange(state)
     }
+}
 
-    @objc private func onPause(_ note: Notification) {
-        HapticEngineManager.shared.pauseHaptics()
+@objc private class SPTQueueSwizzle: NSObject {
+    @objc func playerImpl(_ playerImpl: AnyObject, stateDidChange state: AnyObject) {
+        self.playerImpl(playerImpl, stateDidChange: state)
+        handleStateChange(state)
     }
+}
 
-    @objc private func onStop(_ note: Notification) {
-        HapticEngineManager.shared.stopHaptics()
+@objc private class SPTNowPlayingSwizzle: NSObject {
+    @objc func setCurrentTrack(_ track: AnyObject) {
+        self.setCurrentTrack(track)
+        let uri = (track as? NSObject)?.value(forKeyPath: "URI") as? String
+            ?? (track as? NSObject)?.value(forKeyPath: "trackUri") as? String
+            ?? (track as? NSObject)?.value(forKeyPath: "name") as? String
+        guard let id = uri, !id.isEmpty else { return }
+        os_log("SPTNowPlayingModel track: %{public}@", log: hlog, type: .debug, id)
+        HapticEngineManager.shared.playHaptics(forTrackID: id)
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - App lifecycle hooks (background / foreground)
+// MARK: - NSNotificationCenter observer
 // ─────────────────────────────────────────────────────────────────────────────
 
+private let kTrackDidChange = "SPTNowPlayingItemDidChangeNotification"
+private let kPlaybackPlay   = "SPTPlaybackPlayNotification"
+private let kPlaybackPause  = "SPTPlaybackPauseNotification"
+private let kPlaybackStop   = "SPTPlaybackStopNotification"
+
+final class SpotHapticsNotificationObserver {
+    static let shared = SpotHapticsNotificationObserver()
+    private init() {
+        let nc = NotificationCenter.default
+        nc.addObserver(self, selector: #selector(onTrackChange(_:)),
+                       name: NSNotification.Name(kTrackDidChange), object: nil)
+        nc.addObserver(self, selector: #selector(onPlay(_:)),
+                       name: NSNotification.Name(kPlaybackPlay), object: nil)
+        nc.addObserver(self, selector: #selector(onPause(_:)),
+                       name: NSNotification.Name(kPlaybackPause), object: nil)
+        nc.addObserver(self, selector: #selector(onStop(_:)),
+                       name: NSNotification.Name(kPlaybackStop), object: nil)
+        os_log("Notification observers registered", log: hlog, type: .info)
+    }
+    @objc private func onTrackChange(_ note: Notification) {
+        let id = (note.userInfo?["SPTNowPlayingItemURI"] as? String)
+            ?? (note.userInfo?["uri"] as? String)
+            ?? (note.userInfo?["trackUri"] as? String)
+            ?? (note.userInfo?["SPTNowPlayingTrackTitle"] as? String)
+        guard let trackID = id, !trackID.isEmpty else { return }
+        HapticEngineManager.shared.playHaptics(forTrackID: trackID)
+    }
+    @objc private func onPlay(_ note: Notification)  { HapticEngineManager.shared.resumeHaptics() }
+    @objc private func onPause(_ note: Notification) { HapticEngineManager.shared.pauseHaptics() }
+    @objc private func onStop(_ note: Notification)  { HapticEngineManager.shared.stopHaptics() }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - UIApplication lifecycle (ClassHook is safe here — UIApplication
+//         is always present in every iOS process)
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct SpotHapticsGroup: HookGroup {}
+
 class UIApplicationHook: ClassHook<UIApplication> {
-    typealias Group = SpotHapticsGroup   // UIApplication always exists — safe to activate unconditionally
+    typealias Group = SpotHapticsGroup
 
     func applicationDidEnterBackground(_ application: UIApplication) {
         orig.applicationDidEnterBackground(application)
         HapticEngineManager.shared.teardown()
     }
-
     func applicationWillEnterForeground(_ application: UIApplication) {
         orig.applicationWillEnterForeground(application)
         os_log("App foregrounded – haptic engine will re-arm on next play",
@@ -271,42 +194,42 @@ class UIApplicationHook: ClassHook<UIApplication> {
 
 struct SpotHaptics: Tweak {
     init() {
-        // ── Spotify-internal hooks ────────────────────────────────────────────
-        // IMPORTANT: Orion calls fatalError if a ClassHook's targetName class
-        // doesn't exist in the process at activation time. Each Spotify class
-        // is guarded with NSClassFromString so a missing class is gracefully
-        // logged and skipped instead of crashing the app.
-
-        if NSClassFromString("SPTPlayerImpl") != nil {
-            SPTPlayerImplGroup().activate()
-            os_log("SPTPlayerImpl hook: active", log: hlog, type: .info)
-        } else {
-            os_log("SPTPlayerImpl not found — hook skipped (renamed in this Spotify build?)",
-                   log: hlog, type: .error)
-        }
-
-        if NSClassFromString("SPTQueueServicePlayerImpl") != nil {
-            SPTQueueServiceGroup().activate()
-            os_log("SPTQueueServicePlayerImpl hook: active", log: hlog, type: .info)
-        } else {
-            os_log("SPTQueueServicePlayerImpl not found — hook skipped",
-                   log: hlog, type: .info)
-        }
-
-        if NSClassFromString("SPTNowPlayingModel") != nil {
-            SPTNowPlayingGroup().activate()
-            os_log("SPTNowPlayingModel hook: active", log: hlog, type: .info)
-        } else {
-            os_log("SPTNowPlayingModel not found — hook skipped",
-                   log: hlog, type: .info)
-        }
-
-        // ── UIApplication hook (always safe — UIApplication always exists) ───
+        // UIApplication hook via Orion — always safe
         SpotHapticsGroup().activate()
 
-        // ── Notification observer (works regardless of class hooks) ───────────
+        // ── Runtime swizzles (guarded — missing class = skip, not crash) ─────
+        if let cls = NSClassFromString("SPTPlayerImpl") {
+            swizzle(targetClass: cls,
+                    selector: #selector(SPTPlayerImplSwizzle.playerImpl(_:stateDidChange:)),
+                    replacementClass: SPTPlayerImplSwizzle.self)
+            swizzle(targetClass: cls,
+                    selector: #selector(SPTPlayerImplSwizzle.playerImpl(_:didChangeState:)),
+                    replacementClass: SPTPlayerImplSwizzle.self)
+        } else {
+            os_log("SPTPlayerImpl not found — swizzle skipped", log: hlog, type: .error)
+        }
+
+        if let cls = NSClassFromString("SPTQueueServicePlayerImpl") {
+            swizzle(targetClass: cls,
+                    selector: #selector(SPTQueueSwizzle.playerImpl(_:stateDidChange:)),
+                    replacementClass: SPTQueueSwizzle.self)
+        } else {
+            os_log("SPTQueueServicePlayerImpl not found — swizzle skipped",
+                   log: hlog, type: .info)
+        }
+
+        if let cls = NSClassFromString("SPTNowPlayingModel") {
+            swizzle(targetClass: cls,
+                    selector: #selector(SPTNowPlayingSwizzle.setCurrentTrack(_:)),
+                    replacementClass: SPTNowPlayingSwizzle.self)
+        } else {
+            os_log("SPTNowPlayingModel not found — swizzle skipped",
+                   log: hlog, type: .info)
+        }
+
+        // Belt-and-suspenders: notification observer always runs
         _ = SpotHapticsNotificationObserver.shared
 
-        os_log("SpotHaptics loaded — haptic hooks active", log: hlog, type: .info)
+        os_log("SpotHaptics loaded — hooks active", log: hlog, type: .info)
     }
 }
