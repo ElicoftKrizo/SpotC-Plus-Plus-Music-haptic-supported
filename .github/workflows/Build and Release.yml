@@ -232,6 +232,29 @@ jobs:
     # Installs Theos (if not cached), compiles SpotHaptics via Orion/Swift,
     # and produces a .deb that Cyan will inject alongside the other tweaks.
 
+    # ╔══════════════════════════════════════════════════════════════════════╗
+    # ║  FIX: Install ldid — the Theos code-signing dependency             ║
+    # ║                                                                      ║
+    # ║  ROOT CAUSE of "bash: ldid: command not found" (exit 127):          ║
+    # ║  The manual `git clone` of Theos below does NOT run the official    ║
+    # ║  Theos bootstrap script, which is the only place `brew install      ║
+    # ║  ldid` would normally be called. Without it, ldid is simply never   ║
+    # ║  installed on the runner, so every Theos signing invocation fails.  ║
+    # ║                                                                      ║
+    # ║  This step is intentionally UNCONDITIONAL and placed BEFORE the     ║
+    # ║  Theos cache/install steps so ldid is present whether Theos is      ║
+    # ║  freshly cloned OR restored from cache.  The $GITHUB_PATH append    ║
+    # ║  ensures /opt/homebrew/bin is in PATH for ALL subsequent steps,     ║
+    # ║  including every bash subshell that Theos's signing rules spawn.    ║
+    # ╚══════════════════════════════════════════════════════════════════════╝
+    - name: Install ldid (Theos code-signing dependency)
+      run: |
+        brew install ldid
+        # Persist /opt/homebrew/bin in PATH for every subsequent step,
+        # including subshells spawned by make and Theos signing scripts.
+        echo "/opt/homebrew/bin" >> $GITHUB_PATH
+        echo "✅ ldid installed: $(brew list --versions ldid)"
+
     - name: Cache Theos
       id: cache-theos
       uses: actions/cache@v4
@@ -244,20 +267,34 @@ jobs:
       run: |
         # Manually clone Theos directly into /opt/theos
         sudo git clone --recursive https://github.com/theos/theos.git /opt/theos
-        
+
         # Clone ONLY the iOS 16.5 SDK directly into the sdks directory using git depth
         sudo mkdir -p /opt/theos/sdks
         sudo git clone --depth=1 https://github.com/theos/sdks.git /tmp/theos-sdks
         sudo mv /tmp/theos-sdks/iPhoneOS16.5.sdk /opt/theos/sdks/
         sudo rm -rf /tmp/theos-sdks
-        
+
         # Set proper folder permissions for the runner
         sudo chown -R $USER /opt/theos
         echo "Theos and iOS SDK manually installed successfully! ✅"
+
+    # ╔══════════════════════════════════════════════════════════════════════╗
+    # ║  FIX: Belt-and-suspenders PATH + LDID exports in the build step    ║
+    # ║                                                                      ║
+    # ║  Even after the $GITHUB_PATH fix above, explicitly re-exporting     ║
+    # ║  PATH and LDID here guarantees the correct values are in scope for  ║
+    # ║  `make` itself AND every child process it forks — including the     ║
+    # ║  deep Theos signing.mk subshell that previously couldn't see ldid. ║
+    # ╚══════════════════════════════════════════════════════════════════════╝
     - name: Build SpotHaptics tweak
       run: |
         cd SpotHaptics
         export THEOS=/opt/theos
+        # Belt-and-suspenders: re-export PATH and LDID explicitly so that
+        # make and every signing subshell it spawns can resolve ldid.
+        export PATH="/opt/homebrew/bin:$PATH"
+        export LDID=/opt/homebrew/bin/ldid
+        echo "==> ldid sanity check: $(which ldid) — version: $(ldid 2>&1 | head -1 || true)"
         make package FINALPACKAGE=1 2>&1
         DEB=$(find packages -name "*.deb" | sort | tail -n1)
         echo "SpotHaptics .deb: $DEB"
