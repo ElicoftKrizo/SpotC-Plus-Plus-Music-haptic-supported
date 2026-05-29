@@ -14,7 +14,8 @@ SpotHaptics_LOGOSFLAGS = -c orion
 SpotHaptics_CFLAGS = -fobjc-arc
 SpotHaptics_SWIFTFLAGS = -I.
 
-# FIX: Force Theos to look in the Homebrew bin directory for ldid!
+# FIX: Add Homebrew bin directory to PATH for ldid to be found globally
+export PATH := /opt/homebrew/bin:$(PATH)
 export LDID = /opt/homebrew/bin/ldid
 
 include $(THEOS)/makefiles/tweak.mk
