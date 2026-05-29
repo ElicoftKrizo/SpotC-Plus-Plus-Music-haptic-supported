@@ -310,7 +310,66 @@ jobs:
         echo "📥 Downloading audio ZIP …"
         mkdir -p custom_audio haptics_output
 
-        curl -L "${{ github.event.inputs.HAPTICS_AUDIO_ZIP_URL }}" -o custom_audio.zip
+        AUDIO_URL="${{ github.event.inputs.HAPTICS_AUDIO_ZIP_URL }}"
+
+        # ── Host-specific direct-link rewriting ──────────────────────────────
+        # Many file-sharing hosts redirect through an HTML confirmation page
+        # instead of serving raw bytes, even with -L.  Rewrite known patterns
+        # to their direct-download equivalents before curling.
+
+        # Google Drive: /file/d/<ID>/view  →  export?id=<ID>&confirm=t
+        if echo "$AUDIO_URL" | grep -q "drive.google.com/file/d/"; then
+          FILE_ID=$(echo "$AUDIO_URL" | sed -E 's|.*/file/d/([^/]+).*|\1|')
+          AUDIO_URL="https://drive.google.com/uc?export=download&id=${FILE_ID}&confirm=t"
+          echo "🔗 Rewritten as Google Drive direct-download URL (id=${FILE_ID})"
+        fi
+
+        # Dropbox: ?dl=0  →  ?dl=1
+        if echo "$AUDIO_URL" | grep -q "dropbox.com"; then
+          AUDIO_URL=$(echo "$AUDIO_URL" | sed 's/?dl=0/?dl=1/g')
+          echo "🔗 Rewritten as Dropbox direct-download URL"
+        fi
+
+        # GitHub release asset: ensure we're not hitting an HTML page
+        # (GitHub release URLs work fine with -L; no rewrite needed)
+
+        # ── Download with full diagnostic headers ────────────────────────────
+        HTTP_CODE=$(curl -L \
+          --fail-with-body \
+          --retry 3 --retry-delay 5 \
+          -H "Accept: application/zip, application/octet-stream, */*" \
+          -A "Mozilla/5.0 (compatible; GitHub-Actions-Bot)" \
+          -w "%{http_code}" \
+          -o custom_audio.zip \
+          "$AUDIO_URL" 2>&1) || true
+
+        echo "HTTP response code: $HTTP_CODE"
+
+        # ── Validate the download is actually a ZIP ──────────────────────────
+        # ZIP files always begin with the magic bytes  PK\x03\x04  (hex 504B0304).
+        MAGIC=$(xxd -l 4 custom_audio.zip 2>/dev/null | awk '{print $2$3}' | tr -d ' ' | head -c8)
+        echo "File magic bytes: $MAGIC"
+
+        if [ "$MAGIC" != "504b0304" ]; then
+          echo ""
+          echo "❌ ERROR: The downloaded file is NOT a valid ZIP archive."
+          echo "   Magic bytes expected: 504b0304  —  got: $MAGIC"
+          echo ""
+          echo "   First 512 bytes of what was downloaded (likely HTML or redirect page):"
+          echo "   ──────────────────────────────────────────────────────────────────────"
+          head -c 512 custom_audio.zip | cat -v
+          echo ""
+          echo "   SOLUTIONS:"
+          echo "   1. Use a direct-download URL (not a preview/share link)."
+          echo "   2. GitHub Releases, Catbox.moe, and raw file CDNs all work reliably."
+          echo "   3. For Google Drive, confirm the file is publicly shared and the"
+          echo "      URL format is /file/d/<ID>/view — the rewriter handles the rest."
+          echo "   4. For Dropbox, ensure the URL ends in ?dl=0 — the rewriter converts"
+          echo "      it to ?dl=1 automatically."
+          exit 1
+        fi
+
+        echo "✅ Download verified as a valid ZIP archive ($(du -sh custom_audio.zip | cut -f1))."
         unzip -q custom_audio.zip -d custom_audio
         rm custom_audio.zip
 
