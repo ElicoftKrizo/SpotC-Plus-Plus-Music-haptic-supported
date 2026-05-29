@@ -245,16 +245,15 @@ jobs:
         # Manually clone Theos directly into /opt/theos
         sudo git clone --recursive https://github.com/theos/theos.git /opt/theos
         
-        # Pull down the genuine release SDK archive straight from the theos/sdks releases mirror
+        # Clone ONLY the iOS 16.5 SDK directly into the sdks directory using git depth
         sudo mkdir -p /opt/theos/sdks
-        curl -LO https://github.com/theos/sdks/releases/download/patched/iPhoneOS16.5.sdk.tar.xz
-        sudo tar -xf iPhoneOS16.5.sdk.tar.xz -C /opt/theos/sdks/
-        rm iPhoneOS16.5.sdk.tar.xz
+        sudo git clone --depth=1 https://github.com/theos/sdks.git /tmp/theos-sdks
+        sudo mv /tmp/theos-sdks/iPhoneOS16.5.sdk /opt/theos/sdks/
+        sudo rm -rf /tmp/theos-sdks
         
         # Set proper folder permissions for the runner
         sudo chown -R $USER /opt/theos
         echo "Theos and iOS SDK manually installed successfully! ✅"
-
     - name: Build SpotHaptics tweak
       run: |
         cd SpotHaptics
